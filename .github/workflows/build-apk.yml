@@ -42,8 +42,11 @@ jobs:
 
       - name: Build Android APK
         run: |
+          if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+            sed -i 's|gradle-[0-9.]*-bin.zip|gradle-8.7-bin.zip|g' gradle/wrapper/gradle-wrapper.properties
+          fi
           if [ ! -f "./gradlew" ]; then
-            gradle wrapper
+            gradle wrapper --gradle-version 8.7
           fi
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace
