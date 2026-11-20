@@ -6,9 +6,9 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@drawable/ic_launcher_glowtts"
         android:label="GlowTTS"
-        android:roundIcon="@mipmap/ic_launcher"
+        android:roundIcon="@drawable/ic_launcher_glowtts"
         android:supportsRtl="true"
         android:theme="@style/Theme.GlowTTS">
 
