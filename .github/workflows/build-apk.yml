@@ -34,7 +34,13 @@ jobs:
           sudo apt-get update && sudo apt-get install -y cmake clang pkg-config libssl-dev perl make
           REAL_CMAKE=$(which cmake)
           sudo mv "$REAL_CMAKE" "${REAL_CMAKE}-real"
-          printf '#!/usr/bin/env bash\nexec "%s-real" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 "$@"\n' "$REAL_CMAKE" | sudo tee "$REAL_CMAKE" > /dev/null
+          cat <<EOF | sudo tee "$REAL_CMAKE" > /dev/null
+#!/usr/bin/env bash
+if [ "\$1" = "-E" ]; then
+  exec "${REAL_CMAKE}-real" "\$@"
+fi
+exec "${REAL_CMAKE}-real" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 "\$@"
+EOF
           sudo chmod +x "$REAL_CMAKE"
 
       - name: Build native Rust library for Android
