@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="20dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Edge TTS Engine"
+            android:textSize="24sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="Teste a síntese de voz e depois selecione este mecanismo nas configurações de TTS do Android."
+            android:textSize="14sp" />
+
+        <EditText
+            android:id="@+id/etSampleText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:gravity="top"
+            android:hint="Digite um texto para ouvir..."
+            android:inputType="textMultiLine"
+            android:minLines="3"
+            android:text="Olá! Este é um teste de voz usando o motor Edge TTS no Android." />
+
+        <Button
+            android:id="@+id/btnSpeak"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="Ouvir teste" />
+
+        <Button
+            android:id="@+id/btnOpenSettings"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Configurações de voz" />
+
+        <Button
+            android:id="@+id/btnOpenSystemTts"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Abrir saída de TTS do sistema" />
+
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Status: pronto"
+            android:textSize="14sp" />
+
+    </LinearLayout>
+</ScrollView>
