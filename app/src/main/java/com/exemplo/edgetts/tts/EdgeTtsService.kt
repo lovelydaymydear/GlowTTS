@@ -7,32 +7,30 @@ import android.speech.tts.SynthesisRequest
 import android.speech.tts.TextToSpeech
 import android.speech.tts.TextToSpeechService
 import android.speech.tts.Voice
-import android.util.Log
+import com.exemplo.edgetts.native.EdgeTtsNative
 import com.exemplo.edgetts.protocol.EdgeTtsClient
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 class EdgeTtsService : TextToSpeechService() {
 
     companion object {
-        private const val TAG = "GlowTtsService"
         private const val PREFS_NAME = "edge_tts_prefs"
         private const val KEY_VOICE = "selected_voice"
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
         private const val KEY_LAST_DIAG = "last_diag_message"
         private const val DEFAULT_VOICE = "pt-BR-FranciscaNeural"
-        private const val PCM_BUFFER_CHUNK_SIZE = 8192
+        private const val SAMPLE_RATE_HZ = 48000
     }
 
-    private val client = EdgeTtsClient()
-    private val decoder = Mp3ToPcmDecoder()
     private val stopRequested = AtomicBoolean(false)
+    @Volatile
+    private var activeRequestId: String? = null
     private var currentLanguage = arrayOf("por", "BRA", "")
 
-    override fun onGetLanguage(): Array<String> {
-        return currentLanguage
-    }
+    override fun onGetLanguage(): Array<String> = currentLanguage
 
     override fun onIsLanguageAvailable(lang: String?, country: String?, variant: String?): Int {
         val normalizedLang = (lang ?: "").lowercase(Locale.US)
@@ -53,11 +51,7 @@ class EdgeTtsService : TextToSpeechService() {
     override fun onLoadLanguage(lang: String?, country: String?, variant: String?): Int {
         val availability = onIsLanguageAvailable(lang, country, variant)
         if (availability != TextToSpeech.LANG_NOT_SUPPORTED) {
-            currentLanguage = arrayOf(
-                lang ?: "por",
-                country ?: "BRA",
-                variant ?: ""
-            )
+            currentLanguage = arrayOf(lang ?: "por", country ?: "BRA", variant ?: "")
         }
         return availability
     }
@@ -66,19 +60,13 @@ class EdgeTtsService : TextToSpeechService() {
         return EdgeTtsClient.DEFAULT_FALLBACK_VOICES.map { v ->
             val parts = v.locale.split("-")
             val locale = if (parts.size >= 2) Locale(parts[0], parts[1]) else Locale("pt", "BR")
-            Voice(
-                v.shortName,
-                locale,
-                Voice.QUALITY_HIGH,
-                Voice.LATENCY_NORMAL,
-                true,
-                emptySet()
-            )
+            Voice(v.shortName, locale, Voice.QUALITY_HIGH, Voice.LATENCY_NORMAL, true, emptySet())
         }
     }
 
     override fun onStop() {
         stopRequested.set(true)
+        activeRequestId?.let { EdgeTtsNative.nativeStop(it) }
     }
 
     override fun onSynthesizeText(request: SynthesisRequest?, callback: SynthesisCallback?) {
@@ -95,60 +83,67 @@ class EdgeTtsService : TextToSpeechService() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val configuredVoice = prefs.getString(KEY_VOICE, DEFAULT_VOICE) ?: DEFAULT_VOICE
         val voice = resolveVoiceForRequest(request, configuredVoice)
-        val ratePercent = prefs.getInt(KEY_RATE_PERCENT, mapSpeechRateToPercent(request.speechRate))
-        val pitchHz = prefs.getInt(KEY_PITCH_HZ, mapPitchToHz(request.pitch))
+        val ratePercent = prefs.getInt(KEY_RATE_PERCENT, (request.speechRate - 100).coerceIn(-50, 100))
+        val pitchHz = prefs.getInt(KEY_PITCH_HZ, (request.pitch - 100).coerceIn(-50, 50))
 
-        saveDiag("A sintetizar com $voice...")
+        val rateStr = if (ratePercent >= 0) "+${ratePercent}%" else "${ratePercent}%"
+        val pitchStr = if (pitchHz >= 0) "+${pitchHz}Hz" else "${pitchHz}Hz"
+        val volumeStr = "+0%"
+
+        val requestId = UUID.randomUUID().toString()
+        activeRequestId = requestId
+        saveDiag("A iniciar síntese ($voice)...")
 
         try {
-            val mp3Bytes = client.synthesizeMp3(
+            val beginError = EdgeTtsNative.nativeBeginSynthesis(
+                requestId = requestId,
                 text = text,
                 voice = voice,
-                ratePercent = ratePercent,
-                pitchHz = pitchHz
+                rate = rateStr,
+                volume = volumeStr,
+                pitch = pitchStr
             )
-
-            if (mp3Bytes.isEmpty()) {
-                val msg = "MP3 vazio para $voice"
-                Log.w(TAG, msg)
-                saveDiag(msg)
+            if (!beginError.isNullOrBlank()) {
+                saveDiag("Erro início: $beginError")
                 callback.error()
                 return
             }
 
-            if (stopRequested.get()) {
-                saveDiag("Interrompido")
-                callback.done()
-                return
+            callback.start(SAMPLE_RATE_HZ, AudioFormat.ENCODING_PCM_16BIT, 1)
+            saveDiag("A reproduzir ($SAMPLE_RATE_HZ Hz)...")
+
+            val chunkMax = callback.maxBufferSize.coerceAtLeast(8192)
+            var totalBytes = 0
+
+            while (!stopRequested.get()) {
+                val pcmChunk = EdgeTtsNative.nativeReadPcmChunk(requestId, chunkMax) ?: break
+                if (pcmChunk.isEmpty()) continue
+                totalBytes += pcmChunk.size
+                val status = callback.audioAvailable(pcmChunk, 0, pcmChunk.size)
+                if (status != TextToSpeech.SUCCESS) {
+                    break
+                }
             }
 
-            saveDiag("MP3 recebido (${mp3Bytes.size}B). A descodificar...")
-            val decoded = decoder.decode(mp3Bytes)
-            if (decoded.pcmBytes.isEmpty()) {
-                val msg = "PCM vazio após descodificar"
-                Log.w(TAG, msg)
-                saveDiag(msg)
+            val nativeErr = EdgeTtsNative.nativeGetLastError(requestId)
+            if (!nativeErr.isNullOrBlank() && totalBytes == 0) {
+                saveDiag("Erro: $nativeErr")
                 callback.error()
                 return
             }
 
-            val safeSampleRate = if (decoded.sampleRateHz > 0) decoded.sampleRateHz else 24000
-            val safeChannels = if (decoded.channelCount > 0) decoded.channelCount else 1
-
-            callback.start(safeSampleRate, AudioFormat.ENCODING_PCM_16BIT, safeChannels)
-            saveDiag("A enviar áudio (${safeSampleRate}Hz)...")
-
-            streamPcmWithBuffer(decoded.pcmBytes, callback)
-
-            saveDiag("OK (${decoded.pcmBytes.size} bytes PCM)")
+            saveDiag("OK ($totalBytes bytes PCM)")
             callback.done()
         } catch (e: Exception) {
-            val detail = e.message?.take(120) ?: e.javaClass.simpleName
-            Log.e(TAG, "Erro ao sintetizar texto com voz=$voice: $detail", e)
-            saveDiag("Erro: $detail")
+            saveDiag("Erro: ${e.message ?: e.javaClass.simpleName}")
             try {
                 callback.error()
             } catch (_: Exception) {
+            }
+        } finally {
+            EdgeTtsNative.nativeStop(requestId)
+            if (activeRequestId == requestId) {
+                activeRequestId = null
             }
         }
     }
@@ -160,37 +155,19 @@ class EdgeTtsService : TextToSpeechService() {
             .apply()
     }
 
-    private fun streamPcmWithBuffer(pcmBytes: ByteArray, callback: SynthesisCallback) {
-        val maxBufferSize = callback.maxBufferSize.coerceAtLeast(PCM_BUFFER_CHUNK_SIZE)
-        val buffer = ByteArray(maxBufferSize)
-        var offset = 0
-
-        while (offset < pcmBytes.size && !stopRequested.get()) {
-            val length = minOf(maxBufferSize, pcmBytes.size - offset)
-            System.arraycopy(pcmBytes, offset, buffer, 0, length)
-            val status = callback.audioAvailable(buffer, 0, length)
-            if (status != TextToSpeech.SUCCESS) {
-                break
-            }
-            offset += length
-        }
-    }
-
     private fun resolveVoiceForRequest(request: SynthesisRequest, fallbackVoice: String): String {
         if (fallbackVoice.isNotBlank() && fallbackVoice.contains("Neural")) {
             val reqLang = (request.language ?: "").lowercase(Locale.US)
             val voiceLang = fallbackVoice.substringBefore("-").lowercase(Locale.US)
-            val matchesPortuguese = voiceLang == "pt" && (reqLang.startsWith("pt") || reqLang.startsWith("por") || reqLang.isBlank())
-            val matchesEnglish = voiceLang == "en" && (reqLang.startsWith("en") || reqLang.startsWith("eng"))
-            val matchesSpanish = voiceLang == "es" && (reqLang.startsWith("es") || reqLang.startsWith("spa"))
-            val matchesFrench = voiceLang == "fr" && (reqLang.startsWith("fr") || reqLang.startsWith("fra"))
-            val matchesGerman = voiceLang == "de" && (reqLang.startsWith("de") || reqLang.startsWith("deu"))
-            val matchesItalian = voiceLang == "it" && (reqLang.startsWith("it") || reqLang.startsWith("ita"))
-            val matchesJapanese = voiceLang == "ja" && (reqLang.startsWith("ja") || reqLang.startsWith("jpn"))
-            val matchesChinese = voiceLang == "zh" && (reqLang.startsWith("zh") || reqLang.startsWith("zho"))
-
-            if (reqLang.isBlank() || matchesPortuguese || matchesEnglish || matchesSpanish ||
-                matchesFrench || matchesGerman || matchesItalian || matchesJapanese || matchesChinese
+            if (reqLang.isBlank() || reqLang.startsWith(voiceLang) ||
+                (voiceLang == "pt" && reqLang.startsWith("por")) ||
+                (voiceLang == "en" && reqLang.startsWith("eng")) ||
+                (voiceLang == "es" && reqLang.startsWith("spa")) ||
+                (voiceLang == "fr" && reqLang.startsWith("fra")) ||
+                (voiceLang == "de" && reqLang.startsWith("deu")) ||
+                (voiceLang == "it" && reqLang.startsWith("ita")) ||
+                (voiceLang == "ja" && reqLang.startsWith("jpn")) ||
+                (voiceLang == "zh" && reqLang.startsWith("zho"))
             ) {
                 return fallbackVoice
             }
@@ -198,14 +175,11 @@ class EdgeTtsService : TextToSpeechService() {
 
         val lang = (request.language ?: "").lowercase(Locale.US)
         val country = (request.country ?: "").uppercase(Locale.US)
-
         return when {
-            lang.startsWith("por") || lang.startsWith("pt") -> {
+            lang.startsWith("por") || lang.startsWith("pt") ->
                 if (country == "PRT" || country == "PT") "pt-PT-RaquelNeural" else "pt-BR-FranciscaNeural"
-            }
-            lang.startsWith("eng") || lang.startsWith("en") -> {
+            lang.startsWith("eng") || lang.startsWith("en") ->
                 if (country == "GBR" || country == "GB") "en-GB-SoniaNeural" else "en-US-JennyNeural"
-            }
             lang.startsWith("spa") || lang.startsWith("es") -> "es-ES-ElviraNeural"
             lang.startsWith("fra") || lang.startsWith("fr") -> "fr-FR-DeniseNeural"
             lang.startsWith("deu") || lang.startsWith("de") -> "de-DE-KatjaNeural"
@@ -214,15 +188,5 @@ class EdgeTtsService : TextToSpeechService() {
             lang.startsWith("zho") || lang.startsWith("zh") -> "zh-CN-XiaoxiaoNeural"
             else -> fallbackVoice
         }
-    }
-
-    private fun mapSpeechRateToPercent(speechRate: Int): Int {
-        val delta = speechRate - 100
-        return delta.coerceIn(-50, 100)
-    }
-
-    private fun mapPitchToHz(pitch: Int): Int {
-        val delta = pitch - 100
-        return delta.coerceIn(-50, 50)
     }
 }
