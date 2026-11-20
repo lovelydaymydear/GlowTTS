@@ -18,16 +18,17 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.tvStatus.text = "Status: inicializando GlowTTS..."
+        binding.tvStatus.text = "Status: conectando ao GlowTTS ($packageName)..."
 
         tts = TextToSpeech(this, { status ->
             if (status == TextToSpeech.SUCCESS) {
                 ttsReady = true
                 attachProgressListener()
-                binding.tvStatus.text = "Status: GlowTTS pronto para teste"
+                val currentEngine = tts?.defaultEngine ?: packageName
+                binding.tvStatus.text = "Status: pronto (motor: $currentEngine)"
             } else {
                 ttsReady = false
-                binding.tvStatus.text = "Status: falha ao inicializar TTS (código $status)"
+                binding.tvStatus.text = "Status: falha ao iniciar motor (código $status)"
             }
         }, packageName)
 
@@ -38,13 +39,18 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             if (!ttsReady || tts == null) {
-                binding.tvStatus.text = "Status: TTS ainda não está pronto"
+                binding.tvStatus.text = "Status: motor ainda não inicializou"
                 return@setOnClickListener
             }
-            binding.tvStatus.text = "Status: sintetizando e reproduzindo..."
-            val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "glowtts_test_utterance")
+
+            val prefs = getSharedPreferences("edge_tts_prefs", MODE_PRIVATE)
+            val voice = prefs.getString("selected_voice", "pt-BR-FranciscaNeural") ?: "pt-BR-FranciscaNeural"
+            binding.tvStatus.text = "Status: sintetizando ($voice)..."
+
+            val params = Bundle()
+            val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "glowtts_test_utterance")
             if (result == TextToSpeech.ERROR) {
-                binding.tvStatus.text = "Status: erro ao enfileirar fala no sistema"
+                binding.tvStatus.text = "Status: erro ao enviar texto para o serviço TTS"
             }
         }
 
@@ -67,20 +73,20 @@ class MainActivity : AppCompatActivity() {
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 runOnUiThread {
-                    binding.tvStatus.text = "Status: falando..."
+                    binding.tvStatus.text = "Status: reproduzindo áudio..."
                 }
             }
 
             override fun onDone(utteranceId: String?) {
                 runOnUiThread {
-                    binding.tvStatus.text = "Status: concluído!"
+                    binding.tvStatus.text = "Status: reprodução concluída!"
                 }
             }
 
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
                 runOnUiThread {
-                    binding.tvStatus.text = "Status: erro ao sintetizar voz (verifique internet ou voz)"
+                    binding.tvStatus.text = "Status: erro na síntese (verifique rede ou voz)"
                 }
             }
 
