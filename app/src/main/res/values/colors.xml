@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Fundos escuros profundos -->
+    <color name="glow_bg_dark">#0B0D14</color>
+    <color name="glow_surface">#131724</color>
+    <color name="glow_surface_elevated">#1B2032</color>
+
+    <!-- Destaques néon inspirados no ícone -->
+    <color name="glow_cyan">#29E6FF</color>
+    <color name="glow_purple">#9B5CFF</color>
+    <color name="glow_pink">#FF3E9D</color>
+    <color name="glow_border_subtle">#2D3552</color>
+
+    <!-- Textos e ícones -->
+    <color name="glow_text_primary">#F4F7FF</color>
+    <color name="glow_text_secondary">#A4B0CE</color>
+    <color name="glow_text_on_accent">#080B12</color>
+</resources>
