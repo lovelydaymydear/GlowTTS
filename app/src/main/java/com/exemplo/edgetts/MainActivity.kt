@@ -67,6 +67,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        binding.btnVoiceSettings.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
         binding.btnOpenTtsSettings.setOnClickListener {
             val intent = Intent("com.android.settings.TTS_SETTINGS")
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -75,11 +79,6 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {
                 binding.tvEngineStatus.text = "Status: abra Definições > Acessibilidade > Saída de texto para fala"
             }
-        }
-
-        binding.btnOpenTtsSettings.setOnLongClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
-            true
         }
     }
 
