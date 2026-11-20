@@ -9,8 +9,6 @@ import okio.ByteString
 import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.security.SecureRandom
 import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.UUID
@@ -148,49 +146,67 @@ class EdgeTtsClient(
             }
         }
 
-        val firstError: Throwable? = try {
-            val bytes = synthesizeViaEndpoint(
+        val attempts = listOf(
+            EndpointAttempt(
                 baseUrl = BING_WSS_URL,
                 tokenParamName = "TrustedClientToken",
                 secVersionPrefix = "1-$CHROMIUM_MAJOR.0.0.0",
-                useV2Token = false,
-                text = cleanText,
-                voice = voice,
-                ratePercent = ratePercent,
-                pitchHz = pitchHz
-            )
-            if (bytes.isNotEmpty()) {
-                storeInCache(cacheKey, bytes)
-                return bytes
-            }
-            IllegalStateException("Áudio vazio no endpoint Bing")
-        } catch (t: Throwable) {
-            t
-        }
-
-        return try {
-            val fallbackBytes = synthesizeViaEndpoint(
+                secMsGec = SecMsGec.generateV1(),
+                label = "Bing-V1"
+            ),
+            EndpointAttempt(
+                baseUrl = BING_WSS_URL,
+                tokenParamName = "TrustedClientToken",
+                secVersionPrefix = "1-$CHROMIUM_MAJOR.0.0.0",
+                secMsGec = SecMsGec.generateV2(),
+                label = "Bing-V2"
+            ),
+            EndpointAttempt(
                 baseUrl = EDGE_WSS_URL,
                 tokenParamName = "Ocp-Apim-Subscription-Key",
                 secVersionPrefix = "2-$EDGE_VERSION",
-                useV2Token = true,
-                text = cleanText,
-                voice = voice,
-                ratePercent = ratePercent,
-                pitchHz = pitchHz
+                secMsGec = SecMsGec.generateV2(),
+                label = "Edge-V2"
+            ),
+            EndpointAttempt(
+                baseUrl = EDGE_WSS_URL,
+                tokenParamName = "TrustedClientToken",
+                secVersionPrefix = "1-$CHROMIUM_MAJOR.0.0.0",
+                secMsGec = SecMsGec.generateV1(),
+                label = "Edge-V1"
             )
-            if (fallbackBytes.isNotEmpty()) {
-                storeInCache(cacheKey, fallbackBytes)
-                return fallbackBytes
+        )
+
+        val errors = ArrayList<String>(attempts.size)
+        for (attempt in attempts) {
+            try {
+                val bytes = synthesizeViaEndpoint(
+                    attempt = attempt,
+                    text = cleanText,
+                    voice = voice,
+                    ratePercent = ratePercent,
+                    pitchHz = pitchHz
+                )
+                if (bytes.isNotEmpty()) {
+                    storeInCache(cacheKey, bytes)
+                    return bytes
+                }
+                errors.add("${attempt.label}: áudio vazio")
+            } catch (t: Throwable) {
+                errors.add("${attempt.label}: ${t.message ?: t.javaClass.simpleName}")
             }
-            throw IllegalStateException(firstError?.message ?: "Áudio vazio em ambos os servidores")
-        } catch (secondError: Throwable) {
-            throw IllegalStateException(
-                "${firstError?.message ?: "Erro 1"} | ${secondError.message ?: "Erro 2"}",
-                secondError
-            )
         }
+
+        throw IllegalStateException(errors.joinToString(" | "))
     }
+
+    private data class EndpointAttempt(
+        val baseUrl: String,
+        val tokenParamName: String,
+        val secVersionPrefix: String,
+        val secMsGec: String,
+        val label: String
+    )
 
     private fun storeInCache(key: String, bytes: ByteArray) {
         if (bytes.isEmpty() || maxCacheEntries <= 0) return
@@ -200,29 +216,27 @@ class EdgeTtsClient(
     }
 
     private fun synthesizeViaEndpoint(
-        baseUrl: String,
-        tokenParamName: String,
-        secVersionPrefix: String,
-        useV2Token: Boolean,
+        attempt: EndpointAttempt,
         text: String,
         voice: String,
         ratePercent: Int,
         pitchHz: Int
     ): ByteArray {
-        val secMsGec = if (useV2Token) generateSecMsGecV2() else SecMsGec.generate()
         val connectionId = uuidWithoutHyphens()
         val requestId = uuidWithoutHyphens()
 
-        val separator = if (baseUrl.contains("?")) "&" else "?"
-        val url = "$baseUrl${separator}$tokenParamName=$TRUSTED_CLIENT_TOKEN" +
-            "&Sec-MS-GEC=$secMsGec" +
-            "&Sec-MS-GEC-Version=$secVersionPrefix" +
+        val separator = if (attempt.baseUrl.contains("?")) "&" else "?"
+        val url = "${attempt.baseUrl}${separator}${attempt.tokenParamName}=$TRUSTED_CLIENT_TOKEN" +
+            "&Sec-MS-GEC=${attempt.secMsGec}" +
+            "&Sec-MS-GEC-Version=${attempt.secVersionPrefix}" +
             "&ConnectionId=$connectionId"
 
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", USER_AGENT)
             .header("Origin", ORIGIN)
+            .header("Pragma", "no-cache")
+            .header("Cache-Control", "no-cache")
             .build()
 
         val audioBuffer = ByteArrayOutputStream(16_384)
@@ -272,35 +286,14 @@ class EdgeTtsClient(
         }
 
         val webSocket = httpClient.newWebSocket(request, listener)
-        val finished = doneLatch.await(15, TimeUnit.SECONDS)
+        val finished = doneLatch.await(12, TimeUnit.SECONDS)
         if (!finished) {
             webSocket.cancel()
-            throw IllegalStateException("Timeout 15s no WebSocket")
+            throw IllegalStateException("Timeout 12s no WebSocket")
         }
 
         errorRef.get()?.let { throw it }
         return synchronized(audioBuffer) { audioBuffer.toByteArray() }
-    }
-
-    private fun generateSecMsGecV2(): String {
-        val unixEpochSeconds = System.currentTimeMillis() / 1000L
-        val windowsEpochSeconds = unixEpochSeconds + 11644473600L
-        val roundedSeconds = windowsEpochSeconds - (windowsEpochSeconds % 300L)
-        val ticks = roundedSeconds * 10_000_000L
-
-        val saltBytes = ByteArray(8)
-        SecureRandom().nextBytes(saltBytes)
-        val saltHex = saltBytes.joinToString("") { byte ->
-            String.format(Locale.US, "%02X", byte)
-        }
-
-        val payload = String.format(Locale.US, "%d%s%s", ticks, TRUSTED_CLIENT_TOKEN, saltHex)
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest(payload.toByteArray(StandardCharsets.US_ASCII))
-        val hashHex = digest.joinToString("") { byte ->
-            String.format(Locale.US, "%02X", byte)
-        }
-        return "$saltHex-$hashHex"
     }
 
     private fun buildSpeechConfigMessage(): String {
