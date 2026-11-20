@@ -3,6 +3,7 @@ package com.exemplo.edgetts
 import android.content.Intent
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.appcompat.app.AppCompatActivity
 import com.exemplo.edgetts.databinding.ActivityMainBinding
 
@@ -17,15 +18,16 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.tvStatus.text = "Status: inicializando mecanismo TTS..."
+        binding.tvStatus.text = "Status: inicializando GlowTTS..."
 
         tts = TextToSpeech(this, { status ->
             if (status == TextToSpeech.SUCCESS) {
                 ttsReady = true
-                binding.tvStatus.text = "Status: mecanismo TTS pronto para teste"
+                attachProgressListener()
+                binding.tvStatus.text = "Status: GlowTTS pronto para teste"
             } else {
                 ttsReady = false
-                binding.tvStatus.text = "Status: falha ao inicializar TTS ($status)"
+                binding.tvStatus.text = "Status: falha ao inicializar TTS (código $status)"
             }
         }, packageName)
 
@@ -40,7 +42,10 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             binding.tvStatus.text = "Status: sintetizando e reproduzindo..."
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "edge_tts_test_utterance")
+            val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "glowtts_test_utterance")
+            if (result == TextToSpeech.ERROR) {
+                binding.tvStatus.text = "Status: erro ao enfileirar fala no sistema"
+            }
         }
 
         binding.btnOpenSettings.setOnClickListener {
@@ -56,6 +61,35 @@ class MainActivity : AppCompatActivity() {
                 binding.tvStatus.text = "Status: abra Configurações > Acessibilidade > Saída de texto para fala"
             }
         }
+    }
+
+    private fun attachProgressListener() {
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {
+                runOnUiThread {
+                    binding.tvStatus.text = "Status: falando..."
+                }
+            }
+
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread {
+                    binding.tvStatus.text = "Status: concluído!"
+                }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                runOnUiThread {
+                    binding.tvStatus.text = "Status: erro ao sintetizar voz (verifique internet ou voz)"
+                }
+            }
+
+            override fun onError(utteranceId: String?, errorCode: Int) {
+                runOnUiThread {
+                    binding.tvStatus.text = "Status: erro na síntese (código $errorCode)"
+                }
+            }
+        })
     }
 
     override fun onDestroy() {
