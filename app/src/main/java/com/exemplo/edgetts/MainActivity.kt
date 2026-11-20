@@ -53,9 +53,8 @@ class MainActivity : AppCompatActivity() {
 
             cancelWatchDog()
             val pendingWatchDog = Runnable {
-                if (binding.tvStatus.text.toString().startsWith("Status: a sintetizar")) {
-                    binding.tvStatus.text = "Status: sem resposta do serviço (verifique internet ou seleção de motor)"
-                }
+                val diag = readLastDiag()
+                binding.tvStatus.text = "Status: sem resposta — $diag"
             }
             watchDogRunnable = pendingWatchDog
             mainHandler.postDelayed(pendingWatchDog, 20_000L)
@@ -64,7 +63,7 @@ class MainActivity : AppCompatActivity() {
             val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "glowtts_test_utterance")
             if (result == TextToSpeech.ERROR) {
                 cancelWatchDog()
-                binding.tvStatus.text = "Status: erro ao enviar texto para o serviço TTS"
+                binding.tvStatus.text = "Status: erro ao enviar texto (${readLastDiag()})"
             }
         }
 
@@ -81,6 +80,11 @@ class MainActivity : AppCompatActivity() {
                 binding.tvStatus.text = "Status: abra Definições > Acessibilidade > Saída de texto para fala"
             }
         }
+    }
+
+    private fun readLastDiag(): String {
+        val prefs = getSharedPreferences("edge_tts_prefs", MODE_PRIVATE)
+        return prefs.getString("last_diag_message", "sem registo do serviço") ?: "sem registo do serviço"
     }
 
     private fun attachProgressListener() {
@@ -103,14 +107,14 @@ class MainActivity : AppCompatActivity() {
             override fun onError(utteranceId: String?) {
                 runOnUiThread {
                     cancelWatchDog()
-                    binding.tvStatus.text = "Status: erro na síntese (verifique rede ou voz)"
+                    binding.tvStatus.text = "Status: erro (${readLastDiag()})"
                 }
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
                 runOnUiThread {
                     cancelWatchDog()
-                    binding.tvStatus.text = "Status: erro na síntese (código $errorCode)"
+                    binding.tvStatus.text = "Status: erro $errorCode (${readLastDiag()})"
                 }
             }
         })
