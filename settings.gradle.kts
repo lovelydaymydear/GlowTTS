@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "EdgeTtsEngine"
+rootProject.name = "GlowTTS"
 include(":app")
