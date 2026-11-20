@@ -20,7 +20,9 @@ class EdgeTtsService : TextToSpeechService() {
         private const val KEY_VOICE = "selected_voice"
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
+        private const val KEY_LAST_DIAG = "last_diag_message"
         private const val DEFAULT_VOICE = "pt-BR-FranciscaNeural"
+        private const val PCM_BUFFER_CHUNK_SIZE = 8192
     }
 
     private val client = EdgeTtsClient()
@@ -85,6 +87,7 @@ class EdgeTtsService : TextToSpeechService() {
         stopRequested.set(false)
         val text = request.charSequenceText?.toString()?.trim().orEmpty()
         if (text.isEmpty()) {
+            saveDiag("Texto vazio")
             callback.done()
             return
         }
@@ -95,6 +98,8 @@ class EdgeTtsService : TextToSpeechService() {
         val ratePercent = prefs.getInt(KEY_RATE_PERCENT, mapSpeechRateToPercent(request.speechRate))
         val pitchHz = prefs.getInt(KEY_PITCH_HZ, mapPitchToHz(request.pitch))
 
+        saveDiag("A sintetizar com $voice...")
+
         try {
             val mp3Bytes = client.synthesizeMp3(
                 text = text,
@@ -104,19 +109,25 @@ class EdgeTtsService : TextToSpeechService() {
             )
 
             if (mp3Bytes.isEmpty()) {
-                Log.w(TAG, "Nenhum byte de áudio recebido para voz=$voice")
+                val msg = "MP3 vazio para $voice"
+                Log.w(TAG, msg)
+                saveDiag(msg)
                 callback.error()
                 return
             }
 
             if (stopRequested.get()) {
+                saveDiag("Interrompido")
                 callback.done()
                 return
             }
 
+            saveDiag("MP3 recebido (${mp3Bytes.size}B). A descodificar...")
             val decoded = decoder.decode(mp3Bytes)
             if (decoded.pcmBytes.isEmpty()) {
-                Log.w(TAG, "Falha ao decodificar PCM para voz=$voice")
+                val msg = "PCM vazio após descodificar"
+                Log.w(TAG, msg)
+                saveDiag(msg)
                 callback.error()
                 return
             }
@@ -125,25 +136,43 @@ class EdgeTtsService : TextToSpeechService() {
             val safeChannels = if (decoded.channelCount > 0) decoded.channelCount else 1
 
             callback.start(safeSampleRate, AudioFormat.ENCODING_PCM_16BIT, safeChannels)
+            saveDiag("A enviar áudio (${safeSampleRate}Hz)...")
 
-            val chunkSize = 4096
-            var offset = 0
-            while (offset < decoded.pcmBytes.size && !stopRequested.get()) {
-                val length = minOf(chunkSize, decoded.pcmBytes.size - offset)
-                val status = callback.audioAvailable(decoded.pcmBytes, offset, length)
-                if (status != TextToSpeech.SUCCESS) {
-                    break
-                }
-                offset += length
-            }
+            streamPcmWithBuffer(decoded.pcmBytes, callback)
 
+            saveDiag("OK (${decoded.pcmBytes.size} bytes PCM)")
             callback.done()
         } catch (e: Exception) {
-            Log.e(TAG, "Erro ao sintetizar texto com voz=$voice: ${e.message}", e)
+            val detail = e.message?.take(120) ?: e.javaClass.simpleName
+            Log.e(TAG, "Erro ao sintetizar texto com voz=$voice: $detail", e)
+            saveDiag("Erro: $detail")
             try {
                 callback.error()
             } catch (_: Exception) {
             }
+        }
+    }
+
+    private fun saveDiag(message: String) {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_LAST_DIAG, message)
+            .apply()
+    }
+
+    private fun streamPcmWithBuffer(pcmBytes: ByteArray, callback: SynthesisCallback) {
+        val maxBufferSize = callback.maxBufferSize.coerceAtLeast(PCM_BUFFER_CHUNK_SIZE)
+        val buffer = ByteArray(maxBufferSize)
+        var offset = 0
+
+        while (offset < pcmBytes.size && !stopRequested.get()) {
+            val length = minOf(maxBufferSize, pcmBytes.size - offset)
+            System.arraycopy(pcmBytes, offset, buffer, 0, length)
+            val status = callback.audioAvailable(buffer, 0, length)
+            if (status != TextToSpeech.SUCCESS) {
+                break
+            }
+            offset += length
         }
     }
 
