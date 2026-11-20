@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -31,21 +32,22 @@ data class EdgeVoice(
 
 class EdgeTtsClient(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .build(),
+    private val maxCacheEntries: Int = 20
 ) {
     companion object {
         private const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
         private const val VOICE_LIST_URL =
             "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=$TRUSTED_CLIENT_TOKEN"
-        private const val PRIMARY_WSS_URL =
-            "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
-        private const val FALLBACK_WSS_URL =
+        private const val BING_WSS_URL =
             "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
+        private const val EDGE_WSS_URL =
+            "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
 
-        private const val EDGE_VERSION = "155.0.4283.45"
-        private const val CHROMIUM_MAJOR = "155"
+        private const val EDGE_VERSION = "143.0.3650.75"
+        private const val CHROMIUM_MAJOR = "143"
         private const val OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3"
         private const val AUDIO_MARKER = "Content-Type:audio/mpeg"
 
@@ -75,6 +77,12 @@ class EdgeTtsClient(
         )
     }
 
+    private val audioCache = object : LinkedHashMap<String, ByteArray>(maxCacheEntries, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean {
+            return size > maxCacheEntries
+        }
+    }
+
     fun fetchAllVoices(): List<EdgeVoice> {
         val request = Request.Builder()
             .url(VOICE_LIST_URL)
@@ -84,7 +92,7 @@ class EdgeTtsClient(
 
         httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
-                throw IllegalStateException("Falha ao buscar lista de vozes (HTTP ${response.code})")
+                throw IllegalStateException("HTTP ${response.code} ao obter vozes")
             }
             val body = response.body?.string().orEmpty()
             val array = JSONArray(body)
@@ -108,7 +116,7 @@ class EdgeTtsClient(
             }
 
             if (voices.isEmpty()) {
-                throw IllegalStateException("Lista de vozes retornou vazia.")
+                throw IllegalStateException("Lista de vozes vazia")
             }
 
             return voices.sortedWith(
@@ -125,31 +133,24 @@ class EdgeTtsClient(
         ratePercent: Int = 0,
         pitchHz: Int = 0
     ): ByteArray {
-        val cleanText = escapeXml(text.trim())
+        val trimmedText = text.trim()
+        val cleanText = escapeXml(trimmedText)
         if (cleanText.isEmpty()) {
             return ByteArray(0)
         }
 
-        val primaryError: Throwable? = try {
-            val bytes = synthesizeViaEndpoint(
-                baseUrl = PRIMARY_WSS_URL,
-                tokenParamName = "Ocp-Apim-Subscription-Key",
-                secVersionPrefix = "2-$EDGE_VERSION",
-                useV2Token = true,
-                text = cleanText,
-                voice = voice,
-                ratePercent = ratePercent,
-                pitchHz = pitchHz
-            )
-            if (bytes.isNotEmpty()) return bytes
-            IllegalStateException("Resposta de áudio vazia no servidor principal.")
-        } catch (t: Throwable) {
-            t
+        val cacheKey = "$voice|$ratePercent|$pitchHz|$trimmedText"
+        synchronized(audioCache) {
+            audioCache[cacheKey]?.let { cached ->
+                if (cached.isNotEmpty()) {
+                    return cached.copyOf()
+                }
+            }
         }
 
-        return try {
-            synthesizeViaEndpoint(
-                baseUrl = FALLBACK_WSS_URL,
+        val firstError: Throwable? = try {
+            val bytes = synthesizeViaEndpoint(
+                baseUrl = BING_WSS_URL,
                 tokenParamName = "TrustedClientToken",
                 secVersionPrefix = "1-$CHROMIUM_MAJOR.0.0.0",
                 useV2Token = false,
@@ -158,11 +159,43 @@ class EdgeTtsClient(
                 ratePercent = ratePercent,
                 pitchHz = pitchHz
             )
-        } catch (fallbackError: Throwable) {
-            throw IllegalStateException(
-                primaryError?.message ?: fallbackError.message ?: "Falha ao sintetizar áudio.",
-                fallbackError
+            if (bytes.isNotEmpty()) {
+                storeInCache(cacheKey, bytes)
+                return bytes
+            }
+            IllegalStateException("Áudio vazio no endpoint Bing")
+        } catch (t: Throwable) {
+            t
+        }
+
+        return try {
+            val fallbackBytes = synthesizeViaEndpoint(
+                baseUrl = EDGE_WSS_URL,
+                tokenParamName = "Ocp-Apim-Subscription-Key",
+                secVersionPrefix = "2-$EDGE_VERSION",
+                useV2Token = true,
+                text = cleanText,
+                voice = voice,
+                ratePercent = ratePercent,
+                pitchHz = pitchHz
             )
+            if (fallbackBytes.isNotEmpty()) {
+                storeInCache(cacheKey, fallbackBytes)
+                return fallbackBytes
+            }
+            throw IllegalStateException(firstError?.message ?: "Áudio vazio em ambos os servidores")
+        } catch (secondError: Throwable) {
+            throw IllegalStateException(
+                "${firstError?.message ?: "Erro 1"} | ${secondError.message ?: "Erro 2"}",
+                secondError
+            )
+        }
+    }
+
+    private fun storeInCache(key: String, bytes: ByteArray) {
+        if (bytes.isEmpty() || maxCacheEntries <= 0) return
+        synchronized(audioCache) {
+            audioCache[key] = bytes.copyOf()
         }
     }
 
@@ -192,7 +225,7 @@ class EdgeTtsClient(
             .header("Origin", ORIGIN)
             .build()
 
-        val audioBuffer = ByteArrayOutputStream()
+        val audioBuffer = ByteArrayOutputStream(16_384)
         val errorRef = AtomicReference<Throwable?>(null)
         val doneLatch = CountDownLatch(1)
 
@@ -221,13 +254,15 @@ class EdgeTtsClient(
                 val raw = bytes.toByteArray()
                 val extractedAudio = extractMp3Payload(raw)
                 if (extractedAudio.isNotEmpty()) {
-                    audioBuffer.write(extractedAudio)
+                    synchronized(audioBuffer) {
+                        audioBuffer.write(extractedAudio)
+                    }
                 }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                val codeInfo = response?.code?.let { " (HTTP $it)" } ?: ""
-                errorRef.set(IllegalStateException("WebSocket$codeInfo: ${t.message}", t))
+                val codeInfo = response?.code?.let { " HTTP $it" } ?: ""
+                errorRef.set(IllegalStateException("WSS$codeInfo: ${t.message}", t))
                 doneLatch.countDown()
             }
 
@@ -237,14 +272,14 @@ class EdgeTtsClient(
         }
 
         val webSocket = httpClient.newWebSocket(request, listener)
-        val finished = doneLatch.await(30, TimeUnit.SECONDS)
+        val finished = doneLatch.await(15, TimeUnit.SECONDS)
         if (!finished) {
             webSocket.cancel()
-            throw IllegalStateException("Tempo limite esgotado ao aguardar áudio.")
+            throw IllegalStateException("Timeout 15s no WebSocket")
         }
 
         errorRef.get()?.let { throw it }
-        return audioBuffer.toByteArray()
+        return synchronized(audioBuffer) { audioBuffer.toByteArray() }
     }
 
     private fun generateSecMsGecV2(): String {
