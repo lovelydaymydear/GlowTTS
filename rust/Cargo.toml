@@ -1,0 +1,19 @@
+[package]
+name = "glowtts_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+edge-tts-rust = { git = "https://github.com/Initsnow/edge-tts-rust", rev = "6c9aa62eef53da4650bc34fa3e116ca34d875cfd" }
+futures-util = "0.3"
+jni = "0.21"
+minimp3 = "0.5"
+once_cell = "1.21"
+opus = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+webm-iterable = "0.7"
