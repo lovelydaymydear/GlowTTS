@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Edge TTS Engine"
+        android:label="GlowTTS"
         android:supportsRtl="true"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar">
 
@@ -22,7 +22,7 @@
         <activity
             android:name=".SettingsActivity"
             android:exported="true"
-            android:label="Configurações do Edge TTS" />
+            android:label="Configurações do GlowTTS" />
 
         <service
             android:name=".tts.EdgeTtsService"
