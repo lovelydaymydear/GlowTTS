@@ -22,39 +22,39 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.tvStatus.text = "Status: a ligar ao GlowTTS ($packageName)..."
+        binding.tvEngineStatus.text = "Status: a ligar ao GlowTTS ($packageName)..."
 
         tts = TextToSpeech(this, { status ->
             if (status == TextToSpeech.SUCCESS) {
                 ttsReady = true
                 attachProgressListener()
                 val currentEngine = tts?.defaultEngine ?: packageName
-                binding.tvStatus.text = "Status: pronto (motor: $currentEngine)"
+                binding.tvEngineStatus.text = "Status: pronto (motor: $currentEngine)"
             } else {
                 ttsReady = false
-                binding.tvStatus.text = "Status: falha ao iniciar motor (código $status)"
+                binding.tvEngineStatus.text = "Status: falha ao iniciar motor (código $status)"
             }
         }, packageName)
 
-        binding.btnSpeak.setOnClickListener {
+        binding.btnSpeakSample.setOnClickListener {
             val text = binding.etSampleText.text?.toString()?.trim().orEmpty()
             if (text.isEmpty()) {
-                binding.tvStatus.text = "Status: escreva um texto antes de testar"
+                binding.tvEngineStatus.text = "Status: escreva um texto antes de testar"
                 return@setOnClickListener
             }
             if (!ttsReady || tts == null) {
-                binding.tvStatus.text = "Status: motor ainda não inicializado"
+                binding.tvEngineStatus.text = "Status: motor ainda não inicializado"
                 return@setOnClickListener
             }
 
             val prefs = getSharedPreferences("edge_tts_prefs", MODE_PRIVATE)
             val voice = prefs.getString("selected_voice", "pt-BR-FranciscaNeural") ?: "pt-BR-FranciscaNeural"
-            binding.tvStatus.text = "Status: a sintetizar ($voice)..."
+            binding.tvEngineStatus.text = "Status: a sintetizar ($voice)..."
 
             cancelWatchDog()
             val pendingWatchDog = Runnable {
                 val diag = readLastDiag()
-                binding.tvStatus.text = "Status: sem resposta — $diag"
+                binding.tvEngineStatus.text = "Status: sem resposta — $diag"
             }
             watchDogRunnable = pendingWatchDog
             mainHandler.postDelayed(pendingWatchDog, 20_000L)
@@ -63,22 +63,23 @@ class MainActivity : AppCompatActivity() {
             val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "glowtts_test_utterance")
             if (result == TextToSpeech.ERROR) {
                 cancelWatchDog()
-                binding.tvStatus.text = "Status: erro ao enviar texto (${readLastDiag()})"
+                binding.tvEngineStatus.text = "Status: erro ao enviar texto (${readLastDiag()})"
             }
         }
 
-        binding.btnOpenSettings.setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
-        }
-
-        binding.btnOpenSystemTts.setOnClickListener {
+        binding.btnOpenTtsSettings.setOnClickListener {
             val intent = Intent("com.android.settings.TTS_SETTINGS")
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             try {
                 startActivity(intent)
             } catch (_: Exception) {
-                binding.tvStatus.text = "Status: abra Definições > Acessibilidade > Saída de texto para fala"
+                binding.tvEngineStatus.text = "Status: abra Definições > Acessibilidade > Saída de texto para fala"
             }
+        }
+
+        binding.btnOpenTtsSettings.setOnLongClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+            true
         }
     }
 
@@ -92,14 +93,14 @@ class MainActivity : AppCompatActivity() {
             override fun onStart(utteranceId: String?) {
                 runOnUiThread {
                     cancelWatchDog()
-                    binding.tvStatus.text = "Status: a reproduzir áudio..."
+                    binding.tvEngineStatus.text = "Status: a reproduzir áudio..."
                 }
             }
 
             override fun onDone(utteranceId: String?) {
                 runOnUiThread {
                     cancelWatchDog()
-                    binding.tvStatus.text = "Status: reprodução concluída!"
+                    binding.tvEngineStatus.text = "Status: reprodução concluída!"
                 }
             }
 
@@ -107,14 +108,14 @@ class MainActivity : AppCompatActivity() {
             override fun onError(utteranceId: String?) {
                 runOnUiThread {
                     cancelWatchDog()
-                    binding.tvStatus.text = "Status: erro (${readLastDiag()})"
+                    binding.tvEngineStatus.text = "Status: erro (${readLastDiag()})"
                 }
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
                 runOnUiThread {
                     cancelWatchDog()
-                    binding.tvStatus.text = "Status: erro $errorCode (${readLastDiag()})"
+                    binding.tvEngineStatus.text = "Status: erro $errorCode (${readLastDiag()})"
                 }
             }
         })
