@@ -1,0 +1,578 @@
+use std::collections::{HashMap, VecDeque};
+use std::convert::TryInto;
+use std::io::{Error as IoError, ErrorKind, Read};
+use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+
+use edge_tts_rust::{EdgeTtsClient, SpeakOptions, SynthesisEvent};
+use futures_util::StreamExt;
+use jni::objects::{JByteArray, JClass, JString};
+use jni::sys::{jbyteArray, jstring};
+use jni::JNIEnv;
+use minimp3::{Decoder as Mp3Decoder, Error as Mp3Error};
+use once_cell::sync::Lazy;
+use opus::{Channels, Decoder as OpusDecoder};
+use tokio::runtime::{Builder, Runtime};
+use webm_iterable::matroska_spec::{Block, MatroskaSpec, SimpleBlock};
+use webm_iterable::WebmIterator;
+
+type SessionMap = HashMap<String, Arc<SynthesisSession>>;
+
+static SESSIONS: Lazy<Mutex<SessionMap>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime initialization failed")
+});
+static EDGE_TTS_CLIENT: Lazy<Result<EdgeTtsClient, String>> =
+    Lazy::new(|| EdgeTtsClient::new().map_err(|e| e.to_string()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioCodec {
+    WebmOpus,
+    Mp3,
+}
+
+struct ChunkBuffer {
+    chunks: VecDeque<Vec<u8>>,
+    front_offset: usize,
+}
+
+impl ChunkBuffer {
+    fn new() -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            front_offset: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    fn push_copy(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.chunks.push_back(bytes.to_vec());
+        }
+    }
+
+    fn read_into(&mut self, buf: &mut [u8]) -> usize {
+        let mut written = 0;
+        while written < buf.len() {
+            let Some(chunk) = self.chunks.front_mut() else {
+                break;
+            };
+            let available = chunk.len().saturating_sub(self.front_offset);
+            let copy_len = (buf.len() - written).min(available);
+            buf[written..written + copy_len]
+                .copy_from_slice(&chunk[self.front_offset..self.front_offset + copy_len]);
+            written += copy_len;
+            self.front_offset += copy_len;
+            if self.front_offset == chunk.len() {
+                self.chunks.pop_front();
+                self.front_offset = 0;
+            }
+        }
+        written
+    }
+
+    fn take_chunk(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
+        let chunk = self.chunks.front_mut()?;
+        let available = chunk.len().saturating_sub(self.front_offset);
+        if self.front_offset == 0 && available <= max_bytes {
+            return self.chunks.pop_front();
+        }
+        let copy_len = available.min(max_bytes);
+        let bytes = chunk[self.front_offset..self.front_offset + copy_len].to_vec();
+        self.front_offset += copy_len;
+        if self.front_offset == chunk.len() {
+            self.chunks.pop_front();
+            self.front_offset = 0;
+        }
+        Some(bytes)
+    }
+}
+
+struct AudioState {
+    data: ChunkBuffer,
+    closed: bool,
+    error: Option<String>,
+}
+
+struct AudioBuffer {
+    state: Mutex<AudioState>,
+    condvar: Condvar,
+}
+
+impl AudioBuffer {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AudioState {
+                data: ChunkBuffer::new(),
+                closed: false,
+                error: None,
+            }),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        let mut state = self.state.lock().expect("audio state poisoned");
+        state.data.push_copy(bytes);
+        self.condvar.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().expect("audio state poisoned");
+        state.closed = true;
+        self.condvar.notify_all();
+    }
+
+    fn fail(&self, error: String) {
+        let mut state = self.state.lock().expect("audio state poisoned");
+        state.error = Some(error);
+        state.closed = true;
+        self.condvar.notify_all();
+    }
+
+    fn peek_format(&self, stopped: &AtomicBool) -> Result<AudioCodec, String> {
+        let mut state = self.state.lock().expect("audio state poisoned");
+        loop {
+            if stopped.load(Ordering::SeqCst) {
+                return Ok(AudioCodec::Mp3);
+            }
+            if let Some(error) = state.error.clone() {
+                return Err(error);
+            }
+            if let Some(chunk) = state.data.chunks.front() {
+                let available = chunk.len().saturating_sub(state.data.front_offset);
+                if available >= 4 {
+                    let offset = state.data.front_offset;
+                    if &chunk[offset..offset + 4] == &[0x1A, 0x45, 0xDF, 0xA3] {
+                        return Ok(AudioCodec::WebmOpus);
+                    } else {
+                        return Ok(AudioCodec::Mp3);
+                    }
+                }
+            }
+            if state.closed {
+                return Ok(AudioCodec::Mp3);
+            }
+            state = self.condvar.wait(state).expect("audio condvar poisoned");
+        }
+    }
+}
+
+struct BlockingAudioReader {
+    buffer: Arc<AudioBuffer>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Read for BlockingAudioReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut state = self.buffer.state.lock().expect("audio state poisoned");
+        loop {
+            if self.stopped.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            if let Some(error) = state.error.clone() {
+                return Err(IoError::new(ErrorKind::Other, error));
+            }
+            if !state.data.is_empty() {
+                return Ok(state.data.read_into(buf));
+            }
+            if state.closed {
+                return Ok(0);
+            }
+            state = self.buffer.condvar.wait(state).expect("audio condvar poisoned");
+        }
+    }
+}
+
+struct PcmState {
+    data: ChunkBuffer,
+    finished: bool,
+    error: Option<String>,
+}
+
+struct SynthesisSession {
+    pcm_state: Mutex<PcmState>,
+    pcm_condvar: Condvar,
+    stopped: Arc<AtomicBool>,
+}
+
+impl SynthesisSession {
+    fn new() -> Self {
+        Self {
+            pcm_state: Mutex::new(PcmState {
+                data: ChunkBuffer::new(),
+                finished: false,
+                error: None,
+            }),
+            pcm_condvar: Condvar::new(),
+            stopped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn push_pcm(&self, bytes: &[u8]) {
+        let mut state = self.pcm_state.lock().expect("pcm state poisoned");
+        state.data.push_copy(bytes);
+        self.pcm_condvar.notify_all();
+    }
+
+    fn finish(&self) {
+        let mut state = self.pcm_state.lock().expect("pcm state poisoned");
+        state.finished = true;
+        self.pcm_condvar.notify_all();
+    }
+
+    fn fail(&self, error: String) {
+        let mut state = self.pcm_state.lock().expect("pcm state poisoned");
+        state.error = Some(error);
+        state.finished = true;
+        self.pcm_condvar.notify_all();
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.finish();
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.pcm_state.lock().expect("pcm state poisoned").error.clone()
+    }
+
+    fn read_pcm(&self, max_bytes: usize) -> Option<Vec<u8>> {
+        let mut state = self.pcm_state.lock().expect("pcm state poisoned");
+        loop {
+            if !state.data.is_empty() {
+                return state.data.take_chunk(max_bytes);
+            }
+            if state.finished || self.stopped.load(Ordering::SeqCst) {
+                return None;
+            }
+            state = self.pcm_condvar.wait(state).expect("pcm condvar poisoned");
+        }
+    }
+}
+
+fn session(request_id: &str) -> Option<Arc<SynthesisSession>> {
+    SESSIONS.lock().expect("session map poisoned").get(request_id).cloned()
+}
+
+fn insert_session(request_id: String, session: Arc<SynthesisSession>) -> Result<(), String> {
+    let mut sessions = SESSIONS.lock().expect("session map poisoned");
+    sessions.insert(request_id, session);
+    Ok(())
+}
+
+fn remove_session(request_id: &str) -> Option<Arc<SynthesisSession>> {
+    SESSIONS.lock().expect("session map poisoned").remove(request_id)
+}
+
+fn shared_client() -> Result<&'static EdgeTtsClient, String> {
+    EDGE_TTS_CLIENT.as_ref().map_err(Clone::clone)
+}
+
+fn for_each_webm_frame(
+    spec: &MatroskaSpec,
+    mut on_frame: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    match spec {
+        MatroskaSpec::SimpleBlock(_) => {
+            let sb: SimpleBlock = spec.try_into().map_err(|e| format!("SimpleBlock: {e:?}"))?;
+            for frame in sb.read_frame_data().map_err(|e| format!("frame: {e:?}"))? {
+                on_frame(frame.data)?;
+            }
+        }
+        MatroskaSpec::Block(_) => {
+            let b: Block = spec.try_into().map_err(|e| format!("Block: {e:?}"))?;
+            for frame in b.read_frame_data().map_err(|e| format!("frame: {e:?}"))? {
+                on_frame(frame.data)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn spawn_synthesis_worker(
+    request_id: String,
+    session: Arc<SynthesisSession>,
+    text: String,
+    voice: String,
+    rate: String,
+    volume: String,
+    pitch: String,
+) {
+    thread::spawn(move || {
+        let audio_buffer = Arc::new(AudioBuffer::new());
+        let decoder_session = Arc::clone(&session);
+        let decoder_buffer = Arc::clone(&audio_buffer);
+        let decoder_stop = Arc::clone(&session.stopped);
+
+        let decoder_handle = thread::spawn(move || {
+            let codec = match decoder_buffer.peek_format(&decoder_stop) {
+                Ok(c) => c,
+                Err(error) => {
+                    decoder_session.fail(error);
+                    return;
+                }
+            };
+
+            let reader = BlockingAudioReader {
+                buffer: decoder_buffer,
+                stopped: Arc::clone(&decoder_stop),
+            };
+
+            match codec {
+                AudioCodec::WebmOpus => {
+                    let mut opus_dec = match OpusDecoder::new(48000, Channels::Mono) {
+                        Ok(dec) => dec,
+                        Err(error) => {
+                            decoder_session.fail(format!("Opus init: {error}"));
+                            return;
+                        }
+                    };
+                    let mut i16_buf = vec![0i16; 5760 * 2];
+                    for tag in WebmIterator::new(reader, &[]) {
+                        if decoder_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        match tag {
+                            Ok(ref spec) => {
+                                let res = for_each_webm_frame(spec, |frame_data| {
+                                    let samples_decoded = opus_dec
+                                        .decode(frame_data, &mut i16_buf, false)
+                                        .map_err(|err| format!("Opus decode: {err}"))?;
+                                    let mut pcm_bytes = Vec::with_capacity(samples_decoded * 2);
+                                    for &sample in &i16_buf[..samples_decoded] {
+                                        pcm_bytes.extend_from_slice(&sample.to_le_bytes());
+                                    }
+                                    decoder_session.push_pcm(&pcm_bytes);
+                                    Ok(())
+                                });
+                                if let Err(err) = res {
+                                    decoder_session.fail(err);
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                if !decoder_stop.load(Ordering::SeqCst) {
+                                    decoder_session.fail(format!("WebM: {e:?}"));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    decoder_session.finish();
+                }
+                AudioCodec::Mp3 => {
+                    let mut mp3_decoder = Mp3Decoder::new(reader);
+                    let mut last_sample: i16 = 0;
+                    loop {
+                        if decoder_stop.load(Ordering::SeqCst) {
+                            decoder_session.finish();
+                            break;
+                        }
+                        match mp3_decoder.next_frame() {
+                            Ok(frame) => {
+                                let mono_samples: Vec<i16> = if frame.channels == 2 {
+                                    frame
+                                        .data
+                                        .chunks_exact(2)
+                                        .map(|pair| ((pair[0] as i32 + pair[1] as i32) / 2) as i16)
+                                        .collect()
+                                } else {
+                                    frame.data
+                                };
+
+                                let mut pcm_bytes = Vec::with_capacity(mono_samples.len() * 4);
+                                if frame.sample_rate == 24000 {
+                                    for &s in &mono_samples {
+                                        let mid = (((last_sample as i32 + s as i32) / 2) as i16)
+                                            .to_le_bytes();
+                                        pcm_bytes.extend_from_slice(&mid);
+                                        pcm_bytes.extend_from_slice(&s.to_le_bytes());
+                                        last_sample = s;
+                                    }
+                                } else {
+                                    for s in mono_samples {
+                                        pcm_bytes.extend_from_slice(&s.to_le_bytes());
+                                    }
+                                }
+                                decoder_session.push_pcm(&pcm_bytes);
+                            }
+                            Err(Mp3Error::Eof) => {
+                                decoder_session.finish();
+                                break;
+                            }
+                            Err(error) => {
+                                decoder_session.fail(format!("MP3 decode: {error}"));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let network_session = Arc::clone(&session);
+        let network_buffer = Arc::clone(&audio_buffer);
+        let network_result = TOKIO_RUNTIME.block_on(async move {
+            let client = shared_client()?;
+            let mut stream = client
+                .stream(
+                    text,
+                    SpeakOptions {
+                        voice,
+                        rate,
+                        volume,
+                        pitch,
+                        ..SpeakOptions::default()
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
+            while let Some(event) = stream.next().await {
+                if network_session.stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                match event.map_err(|e| e.to_string())? {
+                    SynthesisEvent::Audio(chunk) => network_buffer.push(&chunk),
+                    SynthesisEvent::Boundary(_) => {}
+                }
+            }
+            Ok::<(), String>(())
+        });
+
+        if let Err(error) = network_result {
+            audio_buffer.fail(error.clone());
+            session.fail(error);
+        } else {
+            audio_buffer.close();
+        }
+
+        let _ = decoder_handle.join();
+        if session.last_error().is_none() {
+            session.finish();
+        }
+    });
+}
+
+fn read_java_string(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, String> {
+    env.get_string(&value)
+        .map(|s| s.into())
+        .map_err(|e| e.to_string())
+}
+
+fn into_java_string(env: &mut JNIEnv<'_>, value: Option<String>) -> jstring {
+    match value {
+        Some(v) => env
+            .new_string(v)
+            .map(|s| s.into_raw())
+            .unwrap_or(null_mut()),
+        None => null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_exemplo_edgetts_native_EdgeTtsNative_nativeListVoices(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let result = TOKIO_RUNTIME.block_on(async move {
+        let voices = shared_client()?
+            .list_voices()
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&voices).map_err(|e| e.to_string())
+    });
+
+    into_java_string(
+        &mut env,
+        Some(result.unwrap_or_else(|e| format!("ERROR: {e}"))),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_exemplo_edgetts_native_EdgeTtsNative_nativeBeginSynthesis(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    request_id: JString<'_>,
+    text: JString<'_>,
+    voice: JString<'_>,
+    rate: JString<'_>,
+    volume: JString<'_>,
+    pitch: JString<'_>,
+) -> jstring {
+    let result = (|| -> Result<(), String> {
+        let request_id = read_java_string(&mut env, request_id)?;
+        let text = read_java_string(&mut env, text)?;
+        let voice = read_java_string(&mut env, voice)?;
+        let rate = read_java_string(&mut env, rate)?;
+        let volume = read_java_string(&mut env, volume)?;
+        let pitch = read_java_string(&mut env, pitch)?;
+
+        let session = Arc::new(SynthesisSession::new());
+        insert_session(request_id.clone(), Arc::clone(&session))?;
+        spawn_synthesis_worker(request_id, session, text, voice, rate, volume, pitch);
+        Ok(())
+    })();
+
+    into_java_string(&mut env, result.err())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_exemplo_edgetts_native_EdgeTtsNative_nativeReadPcmChunk(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    request_id: JString<'_>,
+    max_bytes: i32,
+) -> jbyteArray {
+    let request_id = match read_java_string(&mut env, request_id) {
+        Ok(v) => v,
+        Err(_) => return null_mut(),
+    };
+    let max_bytes = max_bytes.max(1024) as usize;
+    let Some(session) = session(&request_id) else {
+        return null_mut();
+    };
+    let Some(bytes) = session.read_pcm(max_bytes) else {
+        return null_mut();
+    };
+    env.byte_array_from_slice(&bytes)
+        .map(JByteArray::into_raw)
+        .unwrap_or(null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_exemplo_edgetts_native_EdgeTtsNative_nativeGetLastError(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    request_id: JString<'_>,
+) -> jstring {
+    let request_id = match read_java_string(&mut env, request_id) {
+        Ok(v) => v,
+        Err(e) => return into_java_string(&mut env, Some(e)),
+    };
+    let error = session(&request_id).and_then(|s| s.last_error());
+    into_java_string(&mut env, error)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_exemplo_edgetts_native_EdgeTtsNative_nativeStop(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    request_id: JString<'_>,
+) {
+    if let Ok(request_id) = read_java_string(&mut env, request_id) {
+        if let Some(session) = remove_session(&request_id) {
+            session.stop();
+        }
+    }
+}
