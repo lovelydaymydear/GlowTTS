@@ -20,46 +20,32 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Voz padrão"
+            android:text="Todas as vozes disponíveis"
             android:textSize="16sp"
             android:textStyle="bold" />
 
-        <RadioGroup
-            android:id="@+id/rgVoices"
+        <EditText
+            android:id="@+id/etVoiceSearch"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp">
+            android:layout_marginTop="8dp"
+            android:hint="Filtrar voz ou idioma (ex.: pt-BR, pt-PT, en-US, Raquel, Jenny)..."
+            android:inputType="text"
+            android:singleLine="true" />
 
-            <RadioButton
-                android:id="@+id/rbPtBrFrancisca"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Português (Brasil) - Francisca (pt-BR-FranciscaNeural)" />
+        <Button
+            android:id="@+id/btnReloadVoices"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Atualizar lista completa de vozes" />
 
-            <RadioButton
-                android:id="@+id/rbPtBrAntonio"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Português (Brasil) - Antônio (pt-BR-AntonioNeural)" />
-
-            <RadioButton
-                android:id="@+id/rbPtPtRaquel"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Português (Portugal) - Raquel (pt-PT-RaquelNeural)" />
-
-            <RadioButton
-                android:id="@+id/rbEnUsJenny"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Inglês (EUA) - Jenny (en-US-JennyNeural)" />
-
-            <RadioButton
-                android:id="@+id/rbEsEsElvira"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Espanhol (Espanha) - Elvira (es-ES-ElviraNeural)" />
-        </RadioGroup>
+        <Spinner
+            android:id="@+id/spVoices"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:minHeight="48dp" />
 
         <TextView
             android:id="@+id/tvRateLabel"
