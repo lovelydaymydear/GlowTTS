@@ -12,6 +12,8 @@ import androidx.appcompat.app.AppCompatActivity
 import com.exemplo.edgetts.databinding.ActivitySettingsBinding
 import com.exemplo.edgetts.protocol.EdgeTtsClient
 import com.exemplo.edgetts.protocol.EdgeVoice
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
 import java.util.concurrent.Executors
 
@@ -23,6 +25,7 @@ class SettingsActivity : AppCompatActivity() {
         private const val KEY_VOICE_LIST = "selected_voices_list"
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
+        private const val KEY_CACHED_VOICES_JSON = "cached_voices_json"
         private const val DEFAULT_VOICE = "pt-BR-FranciscaNeural"
         private const val ALL_LANGUAGES_OPTION = "Todos os idiomas"
     }
@@ -49,6 +52,10 @@ class SettingsActivity : AppCompatActivity() {
         val savedRate = prefs.getInt(KEY_RATE_PERCENT, 0).coerceIn(-50, 50)
         val savedPitch = prefs.getInt(KEY_PITCH_HZ, 0).coerceIn(-50, 50)
 
+        val cachedVoices = loadCachedVoices(prefs.getString(KEY_CACHED_VOICES_JSON, null))
+        val hasCachedVoices = cachedVoices.isNotEmpty()
+        allVoices = if (hasCachedVoices) cachedVoices else EdgeTtsClient.DEFAULT_FALLBACK_VOICES
+
         val rawList = prefs.getString(KEY_VOICE_LIST, savedVoice).orEmpty()
         val parsedList = rawList.split("|")
             .map { it.trim() }
@@ -64,7 +71,11 @@ class SettingsActivity : AppCompatActivity() {
         updateActiveVoicesLabel()
 
         rebuildLanguagesAndVoices(allVoices, savedVoice)
-        binding.tvSettingsStatus.text = "Carregando catálogo completo de vozes..."
+        binding.tvSettingsStatus.text = if (hasCachedVoices) {
+            "Catálogo salvo carregado (${allVoices.size} vozes). Atualizando..."
+        } else {
+            "Carregando catálogo completo de vozes..."
+        }
 
         binding.sbRate.progress = savedRate + 50
         binding.tvRateLabel.text = "Velocidade extra: ${formatSignedPercent(savedRate)}"
@@ -174,19 +185,58 @@ class SettingsActivity : AppCompatActivity() {
         executor.execute {
             try {
                 val remoteVoices = client.fetchAllVoices()
+                val jsonToSave = serializeVoices(remoteVoices)
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_CACHED_VOICES_JSON, jsonToSave)
+                    .apply()
+
                 runOnUiThread {
                     allVoices = remoteVoices
                     rebuildLanguagesAndVoices(allVoices, savedVoice)
-                    binding.tvSettingsStatus.text = "${remoteVoices.size} vozes carregadas! Voz atual: $savedVoice"
+                    binding.tvSettingsStatus.text = "${remoteVoices.size} vozes carregadas e salvas! Voz atual: $savedVoice"
                     binding.btnReloadVoices.isEnabled = true
                 }
             } catch (e: Exception) {
                 runOnUiThread {
                     rebuildLanguagesAndVoices(allVoices, savedVoice)
-                    binding.tvSettingsStatus.text = "Usando lista local (${allVoices.size} vozes). Erro remoto: ${e.message}"
+                    binding.tvSettingsStatus.text = "Mantendo ${allVoices.size} vozes (${e.message})"
                     binding.btnReloadVoices.isEnabled = true
                 }
             }
+        }
+    }
+
+    private fun serializeVoices(voices: List<EdgeVoice>): String {
+        val arr = JSONArray()
+        for (v in voices) {
+            val obj = JSONObject()
+            obj.put("shortName", v.shortName)
+            obj.put("friendlyName", v.friendlyName)
+            obj.put("locale", v.locale)
+            obj.put("gender", v.gender)
+            arr.put(obj)
+        }
+        return arr.toString()
+    }
+
+    private fun loadCachedVoices(rawJson: String?): List<EdgeVoice> {
+        if (rawJson.isNullOrBlank()) return emptyList()
+        return try {
+            val arr = JSONArray(rawJson)
+            val list = ArrayList<EdgeVoice>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val shortName = obj.optString("shortName").trim()
+                if (shortName.isEmpty()) continue
+                val friendlyName = obj.optString("friendlyName").ifBlank { shortName }.trim()
+                val locale = obj.optString("locale").trim()
+                val gender = obj.optString("gender").trim()
+                list.add(EdgeVoice(shortName, friendlyName, locale, gender))
+            }
+            list
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 
