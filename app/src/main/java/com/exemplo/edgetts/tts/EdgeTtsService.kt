@@ -10,6 +10,8 @@ import android.speech.tts.TextToSpeechService
 import android.speech.tts.Voice
 import com.exemplo.edgetts.native.EdgeTtsNative
 import com.exemplo.edgetts.protocol.EdgeTtsClient
+import com.exemplo.edgetts.protocol.EdgeVoice
+import org.json.JSONArray
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -25,6 +27,7 @@ class EdgeTtsService : TextToSpeechService() {
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
         private const val KEY_LAST_DIAG = "last_diag_message"
+        private const val KEY_CACHED_VOICES_JSON = "cached_voices_json"
         private const val DEFAULT_VOICE = "pt-BR-FranciscaNeural"
         private const val SAMPLE_RATE_HZ = 48000
 
@@ -73,10 +76,36 @@ class EdgeTtsService : TextToSpeechService() {
     }
 
     override fun onGetVoices(): List<Voice> {
-        return EdgeTtsClient.DEFAULT_FALLBACK_VOICES.map { v ->
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val cachedJson = prefs.getString(KEY_CACHED_VOICES_JSON, null)
+        val sourceList = parseCachedVoices(cachedJson).ifEmpty {
+            EdgeTtsClient.DEFAULT_FALLBACK_VOICES
+        }
+
+        return sourceList.map { v ->
             val parts = v.locale.split("-")
             val locale = if (parts.size >= 2) Locale(parts[0], parts[1]) else Locale("pt", "BR")
             Voice(v.shortName, locale, Voice.QUALITY_HIGH, Voice.LATENCY_NORMAL, true, emptySet())
+        }
+    }
+
+    private fun parseCachedVoices(rawJson: String?): List<EdgeVoice> {
+        if (rawJson.isNullOrBlank()) return emptyList()
+        return try {
+            val arr = JSONArray(rawJson)
+            val list = ArrayList<EdgeVoice>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val shortName = obj.optString("shortName").trim()
+                if (shortName.isEmpty()) continue
+                val friendlyName = obj.optString("friendlyName").ifBlank { shortName }.trim()
+                val locale = obj.optString("locale").trim()
+                val gender = obj.optString("gender").trim()
+                list.add(EdgeVoice(shortName, friendlyName, locale, gender))
+            }
+            list
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 
