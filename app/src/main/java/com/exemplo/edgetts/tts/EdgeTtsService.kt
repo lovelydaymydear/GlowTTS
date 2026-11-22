@@ -2,6 +2,7 @@ package com.exemplo.edgetts.tts
 
 import android.content.Context
 import android.media.AudioFormat
+import android.os.Build
 import android.speech.tts.SynthesisCallback
 import android.speech.tts.SynthesisRequest
 import android.speech.tts.TextToSpeech
@@ -11,6 +12,8 @@ import com.exemplo.edgetts.native.EdgeTtsNative
 import com.exemplo.edgetts.protocol.EdgeTtsClient
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 
 class EdgeTtsService : TextToSpeechService() {
@@ -18,16 +21,29 @@ class EdgeTtsService : TextToSpeechService() {
     companion object {
         private const val PREFS_NAME = "edge_tts_prefs"
         private const val KEY_VOICE = "selected_voice"
+        private const val KEY_VOICE_LIST = "selected_voices_list"
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
         private const val KEY_LAST_DIAG = "last_diag_message"
         private const val DEFAULT_VOICE = "pt-BR-FranciscaNeural"
         private const val SAMPLE_RATE_HZ = 48000
+
+        private const val MIN_CHUNK_CHARS_BEFORE_SPLIT = 140
+        private const val TARGET_MAX_CHUNK_CHARS = 280
     }
 
     private val stopRequested = AtomicBoolean(false)
+    private val prefetchExecutor = Executors.newSingleThreadExecutor()
+
     @Volatile
     private var activeRequestId: String? = null
+
+    @Volatile
+    private var prefetchedRequestId: String? = null
+
+    @Volatile
+    private var prefetchFuture: Future<*>? = null
+
     private var currentLanguage = arrayOf("por", "BRA", "")
 
     override fun onGetLanguage(): Array<String> = currentLanguage
@@ -66,13 +82,24 @@ class EdgeTtsService : TextToSpeechService() {
 
     override fun onStop() {
         stopRequested.set(true)
+        cancelPrefetch()
         activeRequestId?.let { EdgeTtsNative.nativeStop(it) }
+    }
+
+    override fun onDestroy() {
+        stopRequested.set(true)
+        cancelPrefetch()
+        activeRequestId?.let { EdgeTtsNative.nativeStop(it) }
+        prefetchExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     override fun onSynthesizeText(request: SynthesisRequest?, callback: SynthesisCallback?) {
         if (request == null || callback == null) return
 
         stopRequested.set(false)
+        cancelPrefetch()
+
         val text = request.charSequenceText?.toString()?.trim().orEmpty()
         if (text.isEmpty()) {
             saveDiag("Texto vazio")
@@ -80,9 +107,38 @@ class EdgeTtsService : TextToSpeechService() {
             return
         }
 
+        val chunks = buildBalancedChunks(text)
+        if (chunks.isEmpty()) {
+            saveDiag("Texto vazio")
+            callback.done()
+            return
+        }
+
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val configuredVoice = prefs.getString(KEY_VOICE, DEFAULT_VOICE) ?: DEFAULT_VOICE
-        val voice = resolveVoiceForRequest(request, configuredVoice)
+        val configuredVoice = prefs.getString(KEY_VOICE, DEFAULT_VOICE)?.trim().orEmpty()
+            .ifEmpty { DEFAULT_VOICE }
+        val primaryVoice = resolveVoiceForRequest(request, configuredVoice)
+
+        val savedList = prefs.getString(KEY_VOICE_LIST, primaryVoice).orEmpty()
+            .split("|")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+        val voiceRotation = if (savedList.isNotEmpty()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP &&
+                !request.voiceName.isNullOrBlank() &&
+                request.voiceName!!.contains("Neural") &&
+                !request.voiceName!!.equals(configuredVoice, ignoreCase = true)
+            ) {
+                listOf(primaryVoice)
+            } else {
+                savedList
+            }
+        } else {
+            listOf(primaryVoice)
+        }
+
         val ratePercent = prefs.getInt(KEY_RATE_PERCENT, (request.speechRate - 100).coerceIn(-50, 100))
         val pitchHz = prefs.getInt(KEY_PITCH_HZ, (request.pitch - 100).coerceIn(-50, 50))
 
@@ -90,62 +146,164 @@ class EdgeTtsService : TextToSpeechService() {
         val pitchStr = if (pitchHz >= 0) "+${pitchHz}Hz" else "${pitchHz}Hz"
         val volumeStr = "+0%"
 
-        val requestId = UUID.randomUUID().toString()
-        activeRequestId = requestId
-        saveDiag("A iniciar síntese ($voice)...")
+        var callbackStarted = false
+        var totalBytesAll = 0
+        var currentVoice = voiceRotation[0]
+        var currentReqId = UUID.randomUUID().toString()
+        activeRequestId = currentReqId
+
+        val startErr = EdgeTtsNative.nativeBeginSynthesis(
+            requestId = currentReqId,
+            text = chunks[0],
+            voice = currentVoice,
+            rate = rateStr,
+            volume = volumeStr,
+            pitch = pitchStr
+        )
+        if (!startErr.isNullOrBlank()) {
+            saveDiag("Erro início: $startErr")
+            callback.error()
+            return
+        }
 
         try {
-            val beginError = EdgeTtsNative.nativeBeginSynthesis(
-                requestId = requestId,
-                text = text,
-                voice = voice,
-                rate = rateStr,
-                volume = volumeStr,
-                pitch = pitchStr
-            )
-            if (!beginError.isNullOrBlank()) {
-                saveDiag("Erro início: $beginError")
-                callback.error()
-                return
-            }
+            for (index in chunks.indices) {
+                if (stopRequested.get()) break
 
-            callback.start(SAMPLE_RATE_HZ, AudioFormat.ENCODING_PCM_16BIT, 1)
-            saveDiag("A reproduzir ($SAMPLE_RATE_HZ Hz)...")
+                val reqId = currentReqId
+                val activeVoiceForChunk = currentVoice
+                activeRequestId = reqId
+                saveDiag("A sintetizar (${index + 1}/${chunks.size}, $activeVoiceForChunk)...")
 
-            val chunkMax = callback.maxBufferSize.coerceAtLeast(8192)
-            var totalBytes = 0
+                if (index + 1 < chunks.size) {
+                    val nextText = chunks[index + 1]
+                    val nextVoice = voiceRotation[(index + 1) % voiceRotation.size]
+                    val nextReqId = UUID.randomUUID().toString()
+                    prefetchedRequestId = nextReqId
+                    prefetchFuture = prefetchExecutor.submit {
+                        if (!stopRequested.get()) {
+                            EdgeTtsNative.nativeBeginSynthesis(
+                                requestId = nextReqId,
+                                text = nextText,
+                                voice = nextVoice,
+                                rate = rateStr,
+                                volume = volumeStr,
+                                pitch = pitchStr
+                            )
+                        }
+                    }
+                    currentVoice = nextVoice
+                    currentReqId = nextReqId
+                } else {
+                    prefetchedRequestId = null
+                    prefetchFuture = null
+                }
 
-            while (!stopRequested.get()) {
-                val pcmChunk = EdgeTtsNative.nativeReadPcmChunk(requestId, chunkMax) ?: break
-                if (pcmChunk.isEmpty()) continue
-                totalBytes += pcmChunk.size
-                val status = callback.audioAvailable(pcmChunk, 0, pcmChunk.size)
-                if (status != TextToSpeech.SUCCESS) {
-                    break
+                if (!callbackStarted) {
+                    callback.start(SAMPLE_RATE_HZ, AudioFormat.ENCODING_PCM_16BIT, 1)
+                    callbackStarted = true
+                }
+
+                val chunkMax = callback.maxBufferSize.coerceAtLeast(8192)
+                var segmentBytes = 0
+
+                while (!stopRequested.get()) {
+                    val pcmChunk = EdgeTtsNative.nativeReadPcmChunk(reqId, chunkMax) ?: break
+                    if (pcmChunk.isEmpty()) continue
+                    segmentBytes += pcmChunk.size
+                    totalBytesAll += pcmChunk.size
+                    val status = callback.audioAvailable(pcmChunk, 0, pcmChunk.size)
+                    if (status != TextToSpeech.SUCCESS) {
+                        stopRequested.set(true)
+                        break
+                    }
+                }
+
+                EdgeTtsNative.nativeStop(reqId)
+
+                val nativeErr = EdgeTtsNative.nativeGetLastError(reqId)
+                if (!nativeErr.isNullOrBlank() && segmentBytes == 0 && totalBytesAll == 0) {
+                    cancelPrefetch()
+                    saveDiag("Erro: $nativeErr")
+                    callback.error()
+                    return
                 }
             }
 
-            val nativeErr = EdgeTtsNative.nativeGetLastError(requestId)
-            if (!nativeErr.isNullOrBlank() && totalBytes == 0) {
-                saveDiag("Erro: $nativeErr")
-                callback.error()
-                return
+            if (!callbackStarted) {
+                callback.start(SAMPLE_RATE_HZ, AudioFormat.ENCODING_PCM_16BIT, 1)
             }
-
-            saveDiag("OK ($totalBytes bytes PCM)")
+            saveDiag("OK ($totalBytesAll bytes PCM)")
             callback.done()
         } catch (e: Exception) {
+            cancelPrefetch()
             saveDiag("Erro: ${e.message ?: e.javaClass.simpleName}")
             try {
                 callback.error()
             } catch (_: Exception) {
             }
         } finally {
-            EdgeTtsNative.nativeStop(requestId)
-            if (activeRequestId == requestId) {
-                activeRequestId = null
+            cancelPrefetch()
+            activeRequestId?.let { EdgeTtsNative.nativeStop(it) }
+            activeRequestId = null
+        }
+    }
+
+    private fun cancelPrefetch() {
+        prefetchFuture?.cancel(true)
+        prefetchFuture = null
+        prefetchedRequestId?.let { EdgeTtsNative.nativeStop(it) }
+        prefetchedRequestId = null
+    }
+
+    private fun buildBalancedChunks(text: String): List<String> {
+        val normalized = text.replace("\r\n", "\n").trim()
+        if (normalized.length <= TARGET_MAX_CHUNK_CHARS) {
+            return listOf(normalized)
+        }
+
+        val result = ArrayList<String>()
+        val current = StringBuilder()
+        var i = 0
+
+        while (i < normalized.length) {
+            val ch = normalized[i]
+            current.append(ch)
+
+            val isSentenceEnd = ch == '.' || ch == '!' || ch == '?' || ch == '\n'
+            val nextIsSpaceOrEnd = (i + 1 >= normalized.length) || normalized[i + 1].isWhitespace()
+
+            if (isSentenceEnd && nextIsSpaceOrEnd) {
+                val len = current.length
+                if (len >= MIN_CHUNK_CHARS_BEFORE_SPLIT || len >= TARGET_MAX_CHUNK_CHARS) {
+                    val piece = current.toString().trim()
+                    if (piece.isNotEmpty()) {
+                        result.add(piece)
+                    }
+                    current.setLength(0)
+                }
+            } else if (current.length >= TARGET_MAX_CHUNK_CHARS && ch.isWhitespace()) {
+                val piece = current.toString().trim()
+                if (piece.isNotEmpty()) {
+                    result.add(piece)
+                }
+                current.setLength(0)
+            }
+
+            i++
+        }
+
+        val remainder = current.toString().trim()
+        if (remainder.isNotEmpty()) {
+            if (remainder.length < 60 && result.isNotEmpty()) {
+                val lastIdx = result.lastIndex
+                result[lastIdx] = "${result[lastIdx]} $remainder"
+            } else {
+                result.add(remainder)
             }
         }
+
+        return if (result.isEmpty()) listOf(normalized) else result
     }
 
     private fun saveDiag(message: String) {
@@ -155,22 +313,16 @@ class EdgeTtsService : TextToSpeechService() {
             .apply()
     }
 
-    private fun resolveVoiceForRequest(request: SynthesisRequest, fallbackVoice: String): String {
-        if (fallbackVoice.isNotBlank() && fallbackVoice.contains("Neural")) {
-            val reqLang = (request.language ?: "").lowercase(Locale.US)
-            val voiceLang = fallbackVoice.substringBefore("-").lowercase(Locale.US)
-            if (reqLang.isBlank() || reqLang.startsWith(voiceLang) ||
-                (voiceLang == "pt" && reqLang.startsWith("por")) ||
-                (voiceLang == "en" && reqLang.startsWith("eng")) ||
-                (voiceLang == "es" && reqLang.startsWith("spa")) ||
-                (voiceLang == "fr" && reqLang.startsWith("fra")) ||
-                (voiceLang == "de" && reqLang.startsWith("deu")) ||
-                (voiceLang == "it" && reqLang.startsWith("ita")) ||
-                (voiceLang == "ja" && reqLang.startsWith("jpn")) ||
-                (voiceLang == "zh" && reqLang.startsWith("zho"))
-            ) {
-                return fallbackVoice
+    private fun resolveVoiceForRequest(request: SynthesisRequest, configuredVoice: String): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            val requestedVoiceName = request.voiceName?.trim().orEmpty()
+            if (requestedVoiceName.contains("Neural") && !requestedVoiceName.equals(configuredVoice, ignoreCase = true)) {
+                return requestedVoiceName
             }
+        }
+
+        if (configuredVoice.isNotBlank()) {
+            return configuredVoice
         }
 
         val lang = (request.language ?: "").lowercase(Locale.US)
@@ -186,7 +338,7 @@ class EdgeTtsService : TextToSpeechService() {
             lang.startsWith("ita") || lang.startsWith("it") -> "it-IT-ElsaNeural"
             lang.startsWith("jpn") || lang.startsWith("ja") -> "ja-JP-NanamiNeural"
             lang.startsWith("zho") || lang.startsWith("zh") -> "zh-CN-XiaoxiaoNeural"
-            else -> fallbackVoice
+            else -> DEFAULT_VOICE
         }
     }
 }
