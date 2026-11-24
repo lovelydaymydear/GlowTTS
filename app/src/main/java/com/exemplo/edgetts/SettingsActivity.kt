@@ -24,10 +24,13 @@ class SettingsActivity : AppCompatActivity() {
         private const val KEY_VOICE = "selected_voice"
         private const val KEY_VOICE_LIST = "selected_voices_list"
         private const val KEY_SINGLE_VOICE_MODE = "single_voice_mode"
+        private const val KEY_DIALOGUE_VOICE_ENABLED = "dialogue_voice_enabled"
+        private const val KEY_DIALOGUE_VOICE = "dialogue_voice"
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
         private const val KEY_CACHED_VOICES_JSON = "cached_voices_json"
         private const val DEFAULT_VOICE = "pt-BR-FranciscaNeural"
+        private const val DEFAULT_DIALOGUE_VOICE = "pt-BR-AntonioNeural"
         private const val ALL_LANGUAGES_OPTION = "Todos os idiomas"
     }
 
@@ -40,6 +43,8 @@ class SettingsActivity : AppCompatActivity() {
     private var selectedLanguage: String = ALL_LANGUAGES_OPTION
     private var filteredVoices: List<EdgeVoice> = EdgeTtsClient.DEFAULT_FALLBACK_VOICES
     private var savedVoice: String = DEFAULT_VOICE
+    private var savedDialogueVoice: String = DEFAULT_DIALOGUE_VOICE
+    private var dialogueVoiceEnabled: Boolean = false
     private var singleVoiceMode: Boolean = true
     private val activeVoiceQueue = ArrayList<String>()
 
@@ -51,6 +56,10 @@ class SettingsActivity : AppCompatActivity() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         savedVoice = prefs.getString(KEY_VOICE, DEFAULT_VOICE)?.trim().orEmpty()
             .ifEmpty { DEFAULT_VOICE }
+        savedDialogueVoice = prefs.getString(KEY_DIALOGUE_VOICE, DEFAULT_DIALOGUE_VOICE)?.trim().orEmpty()
+            .ifEmpty { DEFAULT_DIALOGUE_VOICE }
+        dialogueVoiceEnabled = prefs.getBoolean(KEY_DIALOGUE_VOICE_ENABLED, false)
+
         val savedRate = prefs.getInt(KEY_RATE_PERCENT, 0).coerceIn(-50, 50)
         val savedPitch = prefs.getInt(KEY_PITCH_HZ, 0).coerceIn(-50, 50)
 
@@ -75,6 +84,8 @@ class SettingsActivity : AppCompatActivity() {
         allVoices = if (hasCachedVoices) cachedVoices else EdgeTtsClient.DEFAULT_FALLBACK_VOICES
 
         rebuildLanguagesAndVoices(allVoices, savedVoice)
+        updateDialogueStatusLabel()
+
         binding.tvSettingsStatus.text = if (hasCachedVoices) {
             "Catálogo salvo carregado (${allVoices.size} vozes). Atualizando..."
         } else {
@@ -139,6 +150,28 @@ class SettingsActivity : AppCompatActivity() {
             binding.tvSettingsStatus.text = "Modo de voz única: $currentVoice"
         }
 
+        // Define a voz atualmente selecionada como voz para diálogos e alterna o modo de diálogo
+        binding.btnSetDialogueVoice?.setOnClickListener {
+            val currentVoice = filteredVoices.getOrNull(binding.spVoices.selectedItemPosition)?.shortName
+                ?: savedDialogueVoice
+            if (currentVoice.isNotBlank()) {
+                savedDialogueVoice = currentVoice
+                dialogueVoiceEnabled = true
+                updateDialogueStatusLabel()
+                binding.tvSettingsStatus.text = "Voz de diálogo definida: $savedDialogueVoice (ativa)"
+            }
+        }
+
+        binding.btnToggleDialogueVoice?.setOnClickListener {
+            dialogueVoiceEnabled = !dialogueVoiceEnabled
+            updateDialogueStatusLabel()
+            binding.tvSettingsStatus.text = if (dialogueVoiceEnabled) {
+                "Voz para diálogos ativada ($savedDialogueVoice)"
+            } else {
+                "Voz para diálogos desativada"
+            }
+        }
+
         binding.btnReloadVoices.setOnClickListener {
             loadRemoteVoices()
         }
@@ -188,11 +221,14 @@ class SettingsActivity : AppCompatActivity() {
                 .putString(KEY_VOICE, savedVoice)
                 .putString(KEY_VOICE_LIST, serializedQueue)
                 .putBoolean(KEY_SINGLE_VOICE_MODE, singleVoiceMode)
+                .putBoolean(KEY_DIALOGUE_VOICE_ENABLED, dialogueVoiceEnabled)
+                .putString(KEY_DIALOGUE_VOICE, savedDialogueVoice)
                 .putInt(KEY_RATE_PERCENT, ratePercent)
                 .putInt(KEY_PITCH_HZ, pitchHz)
                 .apply()
 
             updateActiveVoicesLabel()
+            updateDialogueStatusLabel()
             binding.tvSettingsStatus.text = if (singleVoiceMode) {
                 "Salvo! Voz única: $savedVoice"
             } else {
@@ -201,6 +237,15 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         loadRemoteVoices()
+    }
+
+    private fun updateDialogueStatusLabel() {
+        val status = if (dialogueVoiceEnabled) {
+            "Diálogo: ATIVO ($savedDialogueVoice)"
+        } else {
+            "Diálogo: DESATIVADO ($savedDialogueVoice)"
+        }
+        binding.tvDialogueVoiceStatus?.text = status
     }
 
     private fun loadRemoteVoices() {
