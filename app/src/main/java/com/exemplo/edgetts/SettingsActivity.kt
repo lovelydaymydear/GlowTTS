@@ -56,8 +56,15 @@ class SettingsActivity : AppCompatActivity() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         savedVoice = prefs.getString(KEY_VOICE, DEFAULT_VOICE)?.trim().orEmpty()
             .ifEmpty { DEFAULT_VOICE }
-        savedDialogueVoice = prefs.getString(KEY_DIALOGUE_VOICE, DEFAULT_DIALOGUE_VOICE)?.trim().orEmpty()
-            .ifEmpty { DEFAULT_DIALOGUE_VOICE }
+
+        // Carrega a voz de diálogo de forma independente da voz geral
+        val storedDialogueVoice = prefs.getString(KEY_DIALOGUE_VOICE, null)?.trim().orEmpty()
+        savedDialogueVoice = if (storedDialogueVoice.isNotEmpty()) {
+            storedDialogueVoice
+        } else {
+            DEFAULT_DIALOGUE_VOICE
+        }
+
         dialogueVoiceEnabled = prefs.getBoolean(KEY_DIALOGUE_VOICE_ENABLED, false)
 
         val savedRate = prefs.getInt(KEY_RATE_PERCENT, 0).coerceIn(-50, 50)
@@ -150,13 +157,17 @@ class SettingsActivity : AppCompatActivity() {
             binding.tvSettingsStatus.text = "Modo de voz única: $currentVoice"
         }
 
-        // Define a voz atualmente selecionada como voz para diálogos e alterna o modo de diálogo
+        // Salva apenas a voz de diálogo escolhida, sem mexer na voz geral
         binding.btnSetDialogueVoice?.setOnClickListener {
             val currentVoice = filteredVoices.getOrNull(binding.spVoices.selectedItemPosition)?.shortName
                 ?: savedDialogueVoice
             if (currentVoice.isNotBlank()) {
                 savedDialogueVoice = currentVoice
                 dialogueVoiceEnabled = true
+                prefs.edit()
+                    .putString(KEY_DIALOGUE_VOICE, savedDialogueVoice)
+                    .putBoolean(KEY_DIALOGUE_VOICE_ENABLED, dialogueVoiceEnabled)
+                    .apply()
                 updateDialogueStatusLabel()
                 binding.tvSettingsStatus.text = "Voz de diálogo definida: $savedDialogueVoice (ativa)"
             }
@@ -164,6 +175,9 @@ class SettingsActivity : AppCompatActivity() {
 
         binding.btnToggleDialogueVoice?.setOnClickListener {
             dialogueVoiceEnabled = !dialogueVoiceEnabled
+            prefs.edit()
+                .putBoolean(KEY_DIALOGUE_VOICE_ENABLED, dialogueVoiceEnabled)
+                .apply()
             updateDialogueStatusLabel()
             binding.tvSettingsStatus.text = if (dialogueVoiceEnabled) {
                 "Voz para diálogos ativada ($savedDialogueVoice)"
@@ -196,10 +210,19 @@ class SettingsActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
         })
 
+        // Salva a voz geral preservando a voz de diálogo já definida
         binding.btnSaveSettings.setOnClickListener {
             val selectedVoiceObj = filteredVoices.getOrNull(binding.spVoices.selectedItemPosition)
             val chosenVoice = selectedVoiceObj?.shortName ?: savedVoice
             savedVoice = chosenVoice
+
+            val currentDialogueInPrefs = prefs.getString(KEY_DIALOGUE_VOICE, null)?.trim().orEmpty()
+            val dialogueVoiceToKeep = if (currentDialogueInPrefs.isNotEmpty()) {
+                currentDialogueInPrefs
+            } else {
+                savedDialogueVoice
+            }
+            savedDialogueVoice = dialogueVoiceToKeep
 
             val finalList = if (singleVoiceMode || activeVoiceQueue.size <= 1) {
                 singleVoiceMode = true
@@ -221,8 +244,8 @@ class SettingsActivity : AppCompatActivity() {
                 .putString(KEY_VOICE, savedVoice)
                 .putString(KEY_VOICE_LIST, serializedQueue)
                 .putBoolean(KEY_SINGLE_VOICE_MODE, singleVoiceMode)
+                .putString(KEY_DIALOGUE_VOICE, dialogueVoiceToKeep)
                 .putBoolean(KEY_DIALOGUE_VOICE_ENABLED, dialogueVoiceEnabled)
-                .putString(KEY_DIALOGUE_VOICE, savedDialogueVoice)
                 .putInt(KEY_RATE_PERCENT, ratePercent)
                 .putInt(KEY_PITCH_HZ, pitchHz)
                 .apply()
@@ -230,7 +253,7 @@ class SettingsActivity : AppCompatActivity() {
             updateActiveVoicesLabel()
             updateDialogueStatusLabel()
             binding.tvSettingsStatus.text = if (singleVoiceMode) {
-                "Salvo! Voz única: $savedVoice"
+                "Salvo! Voz geral: $savedVoice | Diálogo: $savedDialogueVoice (${if (dialogueVoiceEnabled) "ativo" else "inativo"})"
             } else {
                 "Salvo! Rotação (${finalList.size} vozes): $serializedQueue"
             }
