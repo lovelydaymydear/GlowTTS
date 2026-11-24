@@ -23,6 +23,7 @@ class SettingsActivity : AppCompatActivity() {
         private const val PREFS_NAME = "edge_tts_prefs"
         private const val KEY_VOICE = "selected_voice"
         private const val KEY_VOICE_LIST = "selected_voices_list"
+        private const val KEY_SINGLE_VOICE_MODE = "single_voice_mode"
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
         private const val KEY_CACHED_VOICES_JSON = "cached_voices_json"
@@ -39,6 +40,7 @@ class SettingsActivity : AppCompatActivity() {
     private var selectedLanguage: String = ALL_LANGUAGES_OPTION
     private var filteredVoices: List<EdgeVoice> = EdgeTtsClient.DEFAULT_FALLBACK_VOICES
     private var savedVoice: String = DEFAULT_VOICE
+    private var singleVoiceMode: Boolean = true
     private val activeVoiceQueue = ArrayList<String>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,23 +54,25 @@ class SettingsActivity : AppCompatActivity() {
         val savedRate = prefs.getInt(KEY_RATE_PERCENT, 0).coerceIn(-50, 50)
         val savedPitch = prefs.getInt(KEY_PITCH_HZ, 0).coerceIn(-50, 50)
 
-        val cachedVoices = loadCachedVoices(prefs.getString(KEY_CACHED_VOICES_JSON, null))
-        val hasCachedVoices = cachedVoices.isNotEmpty()
-        allVoices = if (hasCachedVoices) cachedVoices else EdgeTtsClient.DEFAULT_FALLBACK_VOICES
-
         val rawList = prefs.getString(KEY_VOICE_LIST, savedVoice).orEmpty()
         val parsedList = rawList.split("|")
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .distinct()
 
+        singleVoiceMode = prefs.getBoolean(KEY_SINGLE_VOICE_MODE, parsedList.size <= 1)
+
         activeVoiceQueue.clear()
-        if (parsedList.isNotEmpty()) {
-            activeVoiceQueue.addAll(parsedList)
-        } else {
+        if (singleVoiceMode || parsedList.isEmpty()) {
             activeVoiceQueue.add(savedVoice)
+        } else {
+            activeVoiceQueue.addAll(parsedList)
         }
         updateActiveVoicesLabel()
+
+        val cachedVoices = loadCachedVoices(prefs.getString(KEY_CACHED_VOICES_JSON, null))
+        val hasCachedVoices = cachedVoices.isNotEmpty()
+        allVoices = if (hasCachedVoices) cachedVoices else EdgeTtsClient.DEFAULT_FALLBACK_VOICES
 
         rebuildLanguagesAndVoices(allVoices, savedVoice)
         binding.tvSettingsStatus.text = if (hasCachedVoices) {
@@ -108,7 +112,15 @@ class SettingsActivity : AppCompatActivity() {
         binding.btnAddVoiceToList.setOnClickListener {
             val currentVoice = filteredVoices.getOrNull(binding.spVoices.selectedItemPosition)?.shortName
                 ?: savedVoice
-            if (currentVoice.isNotBlank() && !activeVoiceQueue.contains(currentVoice)) {
+            if (currentVoice.isBlank()) return@setOnClickListener
+
+            if (singleVoiceMode) {
+                activeVoiceQueue.clear()
+                activeVoiceQueue.add(savedVoice)
+                singleVoiceMode = false
+            }
+
+            if (!activeVoiceQueue.contains(currentVoice)) {
                 activeVoiceQueue.add(currentVoice)
             }
             savedVoice = activeVoiceQueue.firstOrNull() ?: currentVoice
@@ -119,9 +131,10 @@ class SettingsActivity : AppCompatActivity() {
         binding.btnClearVoiceList.setOnClickListener {
             val currentVoice = filteredVoices.getOrNull(binding.spVoices.selectedItemPosition)?.shortName
                 ?: savedVoice
+            singleVoiceMode = true
+            savedVoice = currentVoice
             activeVoiceQueue.clear()
             activeVoiceQueue.add(currentVoice)
-            savedVoice = currentVoice
             updateActiveVoicesLabel()
             binding.tvSettingsStatus.text = "Modo de voz única: $currentVoice"
         }
@@ -155,25 +168,36 @@ class SettingsActivity : AppCompatActivity() {
             val chosenVoice = selectedVoiceObj?.shortName ?: savedVoice
             savedVoice = chosenVoice
 
-            if (activeVoiceQueue.isEmpty()) {
+            val finalList = if (singleVoiceMode || activeVoiceQueue.size <= 1) {
+                singleVoiceMode = true
+                activeVoiceQueue.clear()
                 activeVoiceQueue.add(chosenVoice)
-            } else if (!activeVoiceQueue.contains(chosenVoice)) {
-                activeVoiceQueue[0] = chosenVoice
+                listOf(chosenVoice)
+            } else {
+                if (!activeVoiceQueue.contains(chosenVoice)) {
+                    activeVoiceQueue.add(0, chosenVoice)
+                }
+                activeVoiceQueue.distinct().toList()
             }
 
             val ratePercent = binding.sbRate.progress - 50
             val pitchHz = binding.sbPitch.progress - 50
-            val serializedQueue = activeVoiceQueue.joinToString("|")
+            val serializedQueue = finalList.joinToString("|")
 
             prefs.edit()
                 .putString(KEY_VOICE, savedVoice)
                 .putString(KEY_VOICE_LIST, serializedQueue)
+                .putBoolean(KEY_SINGLE_VOICE_MODE, singleVoiceMode)
                 .putInt(KEY_RATE_PERCENT, ratePercent)
                 .putInt(KEY_PITCH_HZ, pitchHz)
                 .apply()
 
             updateActiveVoicesLabel()
-            binding.tvSettingsStatus.text = "Salvo! Vozes: $serializedQueue"
+            binding.tvSettingsStatus.text = if (singleVoiceMode) {
+                "Salvo! Voz única: $savedVoice"
+            } else {
+                "Salvo! Rotação (${finalList.size} vozes): $serializedQueue"
+            }
         }
 
         loadRemoteVoices()
@@ -300,7 +324,11 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun updateActiveVoicesLabel() {
-        val display = if (activeVoiceQueue.isEmpty()) savedVoice else activeVoiceQueue.joinToString(" → ")
+        val display = if (singleVoiceMode || activeVoiceQueue.size <= 1) {
+            "${activeVoiceQueue.firstOrNull() ?: savedVoice} (voz única)"
+        } else {
+            activeVoiceQueue.joinToString(" → ")
+        }
         binding.tvActiveVoicesList.text = "Vozes em rotação: $display"
     }
 
