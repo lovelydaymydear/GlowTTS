@@ -24,6 +24,7 @@ class EdgeTtsService : TextToSpeechService() {
         private const val PREFS_NAME = "edge_tts_prefs"
         private const val KEY_VOICE = "selected_voice"
         private const val KEY_VOICE_LIST = "selected_voices_list"
+        private const val KEY_SINGLE_VOICE_MODE = "single_voice_mode"
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
         private const val KEY_LAST_DIAG = "last_diag_message"
@@ -154,18 +155,12 @@ class EdgeTtsService : TextToSpeechService() {
             .filter { it.isNotEmpty() }
             .distinct()
 
-        val voiceRotation = if (savedList.isNotEmpty()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP &&
-                !request.voiceName.isNullOrBlank() &&
-                request.voiceName!!.contains("Neural") &&
-                !request.voiceName!!.equals(configuredVoice, ignoreCase = true)
-            ) {
-                listOf(primaryVoice)
-            } else {
-                savedList
-            }
-        } else {
+        val singleVoiceMode = prefs.getBoolean(KEY_SINGLE_VOICE_MODE, savedList.size <= 1)
+
+        val voiceRotation = if (singleVoiceMode || savedList.size <= 1) {
             listOf(primaryVoice)
+        } else {
+            savedList
         }
 
         val ratePercent = prefs.getInt(KEY_RATE_PERCENT, (request.speechRate - 100).coerceIn(-50, 100))
@@ -206,7 +201,11 @@ class EdgeTtsService : TextToSpeechService() {
 
                 if (index + 1 < chunks.size) {
                     val nextText = chunks[index + 1]
-                    val nextVoice = voiceRotation[(index + 1) % voiceRotation.size]
+                    val nextVoice = if (!singleVoiceMode && voiceRotation.size > 1) {
+                        voiceRotation[(index + 1) % voiceRotation.size]
+                    } else {
+                        currentVoice
+                    }
                     val nextReqId = UUID.randomUUID().toString()
                     prefetchedRequestId = nextReqId
                     prefetchFuture = prefetchExecutor.submit {
