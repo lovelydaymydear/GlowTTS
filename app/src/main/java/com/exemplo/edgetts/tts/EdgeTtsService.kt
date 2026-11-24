@@ -25,11 +25,14 @@ class EdgeTtsService : TextToSpeechService() {
         private const val KEY_VOICE = "selected_voice"
         private const val KEY_VOICE_LIST = "selected_voices_list"
         private const val KEY_SINGLE_VOICE_MODE = "single_voice_mode"
+        private const val KEY_DIALOGUE_VOICE_ENABLED = "dialogue_voice_enabled"
+        private const val KEY_DIALOGUE_VOICE = "dialogue_voice"
         private const val KEY_RATE_PERCENT = "rate_percent"
         private const val KEY_PITCH_HZ = "pitch_hz"
         private const val KEY_LAST_DIAG = "last_diag_message"
         private const val KEY_CACHED_VOICES_JSON = "cached_voices_json"
         private const val DEFAULT_VOICE = "pt-BR-FranciscaNeural"
+        private const val DEFAULT_DIALOGUE_VOICE = "pt-BR-AntonioNeural"
         private const val SAMPLE_RATE_HZ = 48000
 
         private const val MIN_CHUNK_CHARS_BEFORE_SPLIT = 140
@@ -149,6 +152,10 @@ class EdgeTtsService : TextToSpeechService() {
             .ifEmpty { DEFAULT_VOICE }
         val primaryVoice = resolveVoiceForRequest(request, configuredVoice)
 
+        val dialogueVoiceEnabled = prefs.getBoolean(KEY_DIALOGUE_VOICE_ENABLED, false)
+        val dialogueVoice = prefs.getString(KEY_DIALOGUE_VOICE, DEFAULT_DIALOGUE_VOICE)?.trim().orEmpty()
+            .ifEmpty { DEFAULT_DIALOGUE_VOICE }
+
         val savedList = prefs.getString(KEY_VOICE_LIST, primaryVoice).orEmpty()
             .split("|")
             .map { it.trim() }
@@ -172,7 +179,15 @@ class EdgeTtsService : TextToSpeechService() {
 
         var callbackStarted = false
         var totalBytesAll = 0
-        var currentVoice = voiceRotation[0]
+        var currentVoice = selectVoiceForChunk(
+            chunkText = chunks[0],
+            chunkIndex = 0,
+            primaryVoice = primaryVoice,
+            voiceRotation = voiceRotation,
+            singleVoiceMode = singleVoiceMode,
+            dialogueVoiceEnabled = dialogueVoiceEnabled,
+            dialogueVoice = dialogueVoice
+        )
         var currentReqId = UUID.randomUUID().toString()
         activeRequestId = currentReqId
 
@@ -201,11 +216,15 @@ class EdgeTtsService : TextToSpeechService() {
 
                 if (index + 1 < chunks.size) {
                     val nextText = chunks[index + 1]
-                    val nextVoice = if (!singleVoiceMode && voiceRotation.size > 1) {
-                        voiceRotation[(index + 1) % voiceRotation.size]
-                    } else {
-                        currentVoice
-                    }
+                    val nextVoice = selectVoiceForChunk(
+                        chunkText = nextText,
+                        chunkIndex = index + 1,
+                        primaryVoice = primaryVoice,
+                        voiceRotation = voiceRotation,
+                        singleVoiceMode = singleVoiceMode,
+                        dialogueVoiceEnabled = dialogueVoiceEnabled,
+                        dialogueVoice = dialogueVoice
+                    )
                     val nextReqId = UUID.randomUUID().toString()
                     prefetchedRequestId = nextReqId
                     prefetchFuture = prefetchExecutor.submit {
@@ -277,6 +296,44 @@ class EdgeTtsService : TextToSpeechService() {
         }
     }
 
+    private fun selectVoiceForChunk(
+        chunkText: String,
+        chunkIndex: Int,
+        primaryVoice: String,
+        voiceRotation: List<String>,
+        singleVoiceMode: Boolean,
+        dialogueVoiceEnabled: Boolean,
+        dialogueVoice: String
+    ): String {
+        if (dialogueVoiceEnabled && dialogueVoice.isNotBlank() && isDialogueText(chunkText)) {
+            return dialogueVoice
+        }
+        if (singleVoiceMode || voiceRotation.size <= 1) {
+            return primaryVoice
+        }
+        return voiceRotation[chunkIndex % voiceRotation.size]
+    }
+
+    private fun isDialogueText(text: String): Boolean {
+        val trimmed = text.trimStart()
+        if (trimmed.isEmpty()) return false
+
+        // Travessões ou aspas no início de fala/diálogo
+        val startsWithMarker = trimmed.startsWith("—") ||
+            trimmed.startsWith("–") ||
+            trimmed.startsWith("\"") ||
+            trimmed.startsWith("“") ||
+            trimmed.startsWith("«") ||
+            (trimmed.startsWith("- ") && trimmed.length > 3)
+
+        if (startsWithMarker) return true
+
+        // Trecho curto/médio contido entre aspas
+        val hasDoubleQuotes = trimmed.count { it == '"' } >= 2
+        val hasCurlyQuotes = trimmed.contains("“") && trimmed.contains("”")
+        return hasDoubleQuotes || hasCurlyQuotes
+    }
+
     private fun cancelPrefetch() {
         prefetchFuture?.cancel(true)
         prefetchFuture = null
@@ -342,13 +399,6 @@ class EdgeTtsService : TextToSpeechService() {
     }
 
     private fun resolveVoiceForRequest(request: SynthesisRequest, configuredVoice: String): String {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            val requestedVoiceName = request.voiceName?.trim().orEmpty()
-            if (requestedVoiceName.contains("Neural") && !requestedVoiceName.equals(configuredVoice, ignoreCase = true)) {
-                return requestedVoiceName
-            }
-        }
-
         if (configuredVoice.isNotBlank()) {
             return configuredVoice
         }
