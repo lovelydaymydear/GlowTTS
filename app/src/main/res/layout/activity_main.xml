@@ -83,13 +83,12 @@
                 android:textColorHint="@color/glow_text_secondary"
                 android:textSize="15sp" />
 
-            <Button
+            <androidx.appcompat.widget.AppCompatButton
                 android:id="@+id/btnSpeakSample"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="14dp"
                 android:background="@drawable/bg_glow_button"
-                android:backgroundTint="@null"
                 android:gravity="center"
                 android:maxLines="2"
                 android:minHeight="52dp"
@@ -100,13 +99,12 @@
                 android:textSize="15sp"
                 android:textStyle="bold" />
 
-            <Button
+            <androidx.appcompat.widget.AppCompatButton
                 android:id="@+id/btnVoiceSettings"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:background="@color/glow_surface_elevated"
-                android:backgroundTint="@null"
                 android:gravity="center"
                 android:maxLines="2"
                 android:minHeight="48dp"
@@ -141,13 +139,12 @@
                 android:textColor="@color/glow_text_secondary"
                 android:textSize="13sp" />
 
-            <Button
+            <androidx.appcompat.widget.AppCompatButton
                 android:id="@+id/btnOpenTtsSettings"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
                 android:background="@color/glow_surface_elevated"
-                android:backgroundTint="@null"
                 android:gravity="center"
                 android:maxLines="2"
                 android:minHeight="48dp"
