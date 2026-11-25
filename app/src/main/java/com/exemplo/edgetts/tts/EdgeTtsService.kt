@@ -2,7 +2,6 @@ package com.exemplo.edgetts.tts
 
 import android.content.Context
 import android.media.AudioFormat
-import android.os.Build
 import android.speech.tts.SynthesisCallback
 import android.speech.tts.SynthesisRequest
 import android.speech.tts.TextToSpeech
@@ -38,6 +37,11 @@ class EdgeTtsService : TextToSpeechService() {
         private const val MIN_CHUNK_CHARS_BEFORE_SPLIT = 140
         private const val TARGET_MAX_CHUNK_CHARS = 280
     }
+
+    private data class SpeechSegment(
+        val text: String,
+        val isDialogue: Boolean
+    )
 
     private val stopRequested = AtomicBoolean(false)
     private val prefetchExecutor = Executors.newSingleThreadExecutor()
@@ -140,13 +144,6 @@ class EdgeTtsService : TextToSpeechService() {
             return
         }
 
-        val chunks = buildBalancedChunks(text)
-        if (chunks.isEmpty()) {
-            saveDiag("Texto vazio")
-            callback.done()
-            return
-        }
-
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val configuredVoice = prefs.getString(KEY_VOICE, DEFAULT_VOICE)?.trim().orEmpty()
             .ifEmpty { DEFAULT_VOICE }
@@ -155,6 +152,18 @@ class EdgeTtsService : TextToSpeechService() {
         val dialogueVoiceEnabled = prefs.getBoolean(KEY_DIALOGUE_VOICE_ENABLED, false)
         val dialogueVoice = prefs.getString(KEY_DIALOGUE_VOICE, DEFAULT_DIALOGUE_VOICE)?.trim().orEmpty()
             .ifEmpty { DEFAULT_DIALOGUE_VOICE }
+
+        val segments = if (dialogueVoiceEnabled && dialogueVoice.isNotBlank()) {
+            buildDialogueAwareSegments(text)
+        } else {
+            buildBalancedChunks(text).map { SpeechSegment(it, isDialogue = false) }
+        }
+
+        if (segments.isEmpty()) {
+            saveDiag("Texto vazio")
+            callback.done()
+            return
+        }
 
         val savedList = prefs.getString(KEY_VOICE_LIST, primaryVoice).orEmpty()
             .split("|")
@@ -179,21 +188,28 @@ class EdgeTtsService : TextToSpeechService() {
 
         var callbackStarted = false
         var totalBytesAll = 0
-        var currentVoice = selectVoiceForChunk(
-            chunkText = chunks[0],
-            chunkIndex = 0,
-            primaryVoice = primaryVoice,
-            voiceRotation = voiceRotation,
-            singleVoiceMode = singleVoiceMode,
-            dialogueVoiceEnabled = dialogueVoiceEnabled,
-            dialogueVoice = dialogueVoice
-        )
+        var narrationIndex = 0
+
+        fun resolveSegmentVoice(seg: SpeechSegment): String {
+            if (seg.isDialogue && dialogueVoiceEnabled && dialogueVoice.isNotBlank()) {
+                return dialogueVoice
+            }
+            val voice = if (singleVoiceMode || voiceRotation.size <= 1) {
+                primaryVoice
+            } else {
+                voiceRotation[narrationIndex % voiceRotation.size]
+            }
+            narrationIndex++
+            return voice
+        }
+
+        var currentVoice = resolveSegmentVoice(segments[0])
         var currentReqId = UUID.randomUUID().toString()
         activeRequestId = currentReqId
 
         val startErr = EdgeTtsNative.nativeBeginSynthesis(
             requestId = currentReqId,
-            text = chunks[0],
+            text = segments[0].text,
             voice = currentVoice,
             rate = rateStr,
             volume = volumeStr,
@@ -206,32 +222,24 @@ class EdgeTtsService : TextToSpeechService() {
         }
 
         try {
-            for (index in chunks.indices) {
+            for (index in segments.indices) {
                 if (stopRequested.get()) break
 
                 val reqId = currentReqId
                 val activeVoiceForChunk = currentVoice
                 activeRequestId = reqId
-                saveDiag("A sintetizar (${index + 1}/${chunks.size}, $activeVoiceForChunk)...")
+                saveDiag("A sintetizar (${index + 1}/${segments.size}, $activeVoiceForChunk)...")
 
-                if (index + 1 < chunks.size) {
-                    val nextText = chunks[index + 1]
-                    val nextVoice = selectVoiceForChunk(
-                        chunkText = nextText,
-                        chunkIndex = index + 1,
-                        primaryVoice = primaryVoice,
-                        voiceRotation = voiceRotation,
-                        singleVoiceMode = singleVoiceMode,
-                        dialogueVoiceEnabled = dialogueVoiceEnabled,
-                        dialogueVoice = dialogueVoice
-                    )
+                if (index + 1 < segments.size) {
+                    val nextSeg = segments[index + 1]
+                    val nextVoice = resolveSegmentVoice(nextSeg)
                     val nextReqId = UUID.randomUUID().toString()
                     prefetchedRequestId = nextReqId
                     prefetchFuture = prefetchExecutor.submit {
                         if (!stopRequested.get()) {
                             EdgeTtsNative.nativeBeginSynthesis(
                                 requestId = nextReqId,
-                                text = nextText,
+                                text = nextSeg.text,
                                 voice = nextVoice,
                                 rate = rateStr,
                                 volume = volumeStr,
@@ -296,42 +304,130 @@ class EdgeTtsService : TextToSpeechService() {
         }
     }
 
-    private fun selectVoiceForChunk(
-        chunkText: String,
-        chunkIndex: Int,
-        primaryVoice: String,
-        voiceRotation: List<String>,
-        singleVoiceMode: Boolean,
-        dialogueVoiceEnabled: Boolean,
-        dialogueVoice: String
-    ): String {
-        if (dialogueVoiceEnabled && dialogueVoice.isNotBlank() && isDialogueText(chunkText)) {
-            return dialogueVoice
+    /**
+     * Separa falas (travessão ou aspas) de trechos narrativos dentro de cada parágrafo,
+     * agrupando blocos consecutivos da mesma categoria para manter a síntese rápida.
+     */
+    private fun buildDialogueAwareSegments(text: String): List<SpeechSegment> {
+        val normalized = text.replace("\r\n", "\n").trim()
+        if (normalized.isEmpty()) return emptyList()
+
+        val rawSegments = ArrayList<SpeechSegment>()
+        val paragraphs = normalized.split("\n")
+
+        for (rawParagraph in paragraphs) {
+            val line = rawParagraph.trim()
+            if (line.isEmpty()) continue
+            extractSegmentsFromLine(line, rawSegments)
         }
-        if (singleVoiceMode || voiceRotation.size <= 1) {
-            return primaryVoice
+
+        if (rawSegments.isEmpty()) {
+            return listOf(SpeechSegment(normalized, isDialogue = false))
         }
-        return voiceRotation[chunkIndex % voiceRotation.size]
+
+        // Agrupa segmentos consecutivos com o mesmo tipo (diálogo + diálogo ou narração + narração)
+        // até o limite TARGET_MAX_CHUNK_CHARS para evitar micro-requisições lentas.
+        val merged = ArrayList<SpeechSegment>()
+        for (seg in rawSegments) {
+            val cleanText = seg.text.trim()
+            if (cleanText.isEmpty()) continue
+
+            val last = merged.lastOrNull()
+            if (last != null &&
+                last.isDialogue == seg.isDialogue &&
+                (last.text.length + 1 + cleanText.length) <= TARGET_MAX_CHUNK_CHARS
+            ) {
+                merged[merged.lastIndex] = SpeechSegment(
+                    text = "${last.text} $cleanText",
+                    isDialogue = last.isDialogue
+                )
+            } else if (cleanText.length > TARGET_MAX_CHUNK_CHARS) {
+                for (subChunk in buildBalancedChunks(cleanText)) {
+                    merged.add(SpeechSegment(subChunk, isDialogue = seg.isDialogue))
+                }
+            } else {
+                merged.add(SpeechSegment(cleanText, isDialogue = seg.isDialogue))
+            }
+        }
+
+        return merged
     }
 
-    private fun isDialogueText(text: String): Boolean {
-        val trimmed = text.trimStart()
-        if (trimmed.isEmpty()) return false
+    private fun extractSegmentsFromLine(line: String, out: MutableList<SpeechSegment>) {
+        // 1. Caso clássico com travessão no início da linha (ex.: "— Olá! — disse ele. — Tudo bem?")
+        if (startsWithDash(line)) {
+            val parts = splitByDashMarkers(line)
+            if (parts.isNotEmpty()) {
+                for (i in parts.indices) {
+                    val piece = parts[i].trim()
+                    if (piece.isEmpty()) continue
+                    // Em diálogos com travessão: índice par (0, 2, 4...) é fala; índice ímpar (1, 3...) é incisa narrativa
+                    val isSpeech = (i % 2 == 0)
+                    out.add(SpeechSegment(piece, isDialogue = isSpeech))
+                }
+                return
+            }
+        }
 
-        // Travessões ou aspas no início de fala/diálogo
-        val startsWithMarker = trimmed.startsWith("—") ||
-            trimmed.startsWith("–") ||
-            trimmed.startsWith("\"") ||
-            trimmed.startsWith("“") ||
-            trimmed.startsWith("«") ||
-            (trimmed.startsWith("- ") && trimmed.length > 3)
+        // 2. Caso de aspas ou fala após narração na mesma linha (ex.: Ela disse: "Oi" e saiu.)
+        val quoteRegex = Regex("""(["“«][^"”»]+["”»])""")
+        var cursor = 0
+        var matchedAny = false
 
-        if (startsWithMarker) return true
+        for (match in quoteRegex.findAll(line)) {
+            matchedAny = true
+            val before = line.substring(cursor, match.range.first).trim()
+            if (before.isNotEmpty()) {
+                out.add(SpeechSegment(before, isDialogue = false))
+            }
+            val speech = match.value.trim()
+            if (speech.isNotEmpty()) {
+                out.add(SpeechSegment(speech, isDialogue = true))
+            }
+            cursor = match.range.last + 1
+        }
 
-        // Trecho curto/médio contido entre aspas
-        val hasDoubleQuotes = trimmed.count { it == '"' } >= 2
-        val hasCurlyQuotes = trimmed.contains("“") && trimmed.contains("”")
-        return hasDoubleQuotes || hasCurlyQuotes
+        if (matchedAny) {
+            val after = line.substring(cursor).trim()
+            if (after.isNotEmpty()) {
+                out.add(SpeechSegment(after, isDialogue = false))
+            }
+            return
+        }
+
+        // 3. Linha puramente narrativa
+        out.add(SpeechSegment(line, isDialogue = false))
+    }
+
+    private fun startsWithDash(text: String): Boolean {
+        val t = text.trimStart()
+        return t.startsWith("—") || t.startsWith("–") || t.startsWith("- ")
+    }
+
+    private fun splitByDashMarkers(line: String): List<String> {
+        val result = ArrayList<String>()
+        val current = StringBuilder()
+        var i = 0
+
+        while (i < line.length) {
+            val ch = line[i]
+            val isLongDash = (ch == '—' || ch == '–')
+            val isHyphenMarker = (ch == '-' && i + 1 < line.length && line[i + 1] == ' ' &&
+                (i == 0 || line[i - 1].isWhitespace()))
+
+            if ((isLongDash || isHyphenMarker) && current.isNotBlank()) {
+                result.add(current.toString().trim())
+                current.setLength(0)
+            }
+
+            current.append(ch)
+            i++
+        }
+
+        if (current.isNotBlank()) {
+            result.add(current.toString().trim())
+        }
+        return result
     }
 
     private fun cancelPrefetch() {
